@@ -7,7 +7,9 @@
 
 pub mod archive;
 pub mod config;
+pub mod dialog;
 pub mod ffi;
+pub mod keys;
 pub mod log;
 pub mod win;
 
@@ -214,6 +216,155 @@ unsafe fn archive<'a>(h: Handle) -> Option<&'a mut Archive> {
 // ---------------------------------------------------------------------------
 // Core logic (Unicode)
 
+/// Paks whose key prompt was cancelled, and when. TC opens a pak several
+/// times per operation (list, then extract); don't ask again right away.
+static DECLINED: Mutex<Vec<(PathBuf, std::time::Instant)>> = Mutex::new(Vec::new());
+const DECLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn recently_declined(path: &Path) -> bool {
+    let mut d = DECLINED.lock().unwrap_or_else(|e| e.into_inner());
+    d.retain(|(_, t)| t.elapsed() < DECLINE_GRACE);
+    d.iter().any(|(p, _)| p == path)
+}
+
+fn mark_declined(path: &Path) {
+    let mut d = DECLINED.lock().unwrap_or_else(|e| e.into_inner());
+    d.push((path.to_path_buf(), std::time::Instant::now()));
+}
+
+fn pak_guid(path: &Path) -> String {
+    archive::sniff_footer(path)
+        .and_then(|f| f.key_guid)
+        .unwrap_or_else(|| keys::ZERO_GUID.to_string())
+}
+
+fn save_key(folder: &Path, guid: &str, key: &keys::AesKey, persist: bool) {
+    match keys::remember(folder, guid, key, persist) {
+        Ok(()) => dlog!(
+            "  key remembered for {} ({})",
+            folder.display(),
+            if persist { "saved" } else { "this session" }
+        ),
+        Err(e) => {
+            dlog!("  could not save key: {e}");
+            show_warning(&format!(
+                "The key works but could not be saved to {}:\n{e}\n\nIt is kept until Total Commander is closed.",
+                keys::KEYS_NAME
+            ));
+        }
+    }
+}
+
+/// Opens a pak, resolving an AES key if its index is encrypted: remembered
+/// keys first (SPEC §3.5), then the key prompt until a key matches or the
+/// user cancels.
+fn open_with_keys(path: &Path, options: &config::Options) -> Result<Archive, OpenError> {
+    match Archive::open(path, options, None) {
+        Err(OpenError::Encrypted) => {}
+        other => return other,
+    }
+    let folder = path.parent().unwrap_or(Path::new("")).to_path_buf();
+    let guid = pak_guid(path);
+    dlog!("  index encrypted, key guid {guid}; looking for a key");
+    for (key, source, from) in keys::candidates(&folder, &guid) {
+        match Archive::open(path, options, Some(&key)) {
+            Ok(arc) => {
+                dlog!("  key from {source:?} record ({from}) matches");
+                if source == keys::Source::Guid {
+                    save_key(&folder, &guid, &key, true);
+                }
+                return Ok(arc);
+            }
+            Err(OpenError::WrongKey) => {
+                dlog!("  key from {source:?} record ({from}) does not match")
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if recently_declined(path) {
+        dlog!("  key prompt was cancelled moments ago; not asking again");
+        return Err(OpenError::Cancelled);
+    }
+    let mut error: Option<String> = None;
+    loop {
+        let answer = dialog::prompt_key(&dialog::KeyPrompt {
+            pak: path,
+            guid: &guid,
+            error: error.as_deref(),
+        });
+        let Some(answer) = answer else {
+            dlog!("  key prompt cancelled");
+            mark_declined(path);
+            return Err(OpenError::Cancelled);
+        };
+        let key = match keys::AesKey::parse(&answer.text) {
+            Ok(k) => k,
+            Err(msg) => {
+                dlog!("  entered key has an invalid format");
+                error = Some(msg.to_string());
+                continue;
+            }
+        };
+        match Archive::open(path, options, Some(&key)) {
+            Ok(arc) => {
+                dlog!("  entered key matches");
+                save_key(&folder, &guid, &key, answer.remember);
+                return Ok(arc);
+            }
+            Err(OpenError::WrongKey) => {
+                dlog!("  entered key does not match");
+                error = Some("This key does not match this pak.".into());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// For a pak with a plain index but encrypted entries: find a key before
+/// extracting one. Entries can't be validated up front, so the first
+/// remembered key is used, otherwise the user is asked once per handle.
+fn ensure_entry_key(arc: &mut Archive) -> Result<(), c_int> {
+    if arc.key.is_some() {
+        return Ok(());
+    }
+    if arc.key_declined {
+        return Err(E_EABORTED);
+    }
+    let path = arc.path.clone();
+    let folder = path.parent().unwrap_or(Path::new("")).to_path_buf();
+    let guid = pak_guid(&path);
+    let key = match keys::candidates(&folder, &guid).into_iter().next() {
+        Some((k, source, from)) => {
+            dlog!("  encrypted entry: using key from {source:?} record ({from})");
+            k
+        }
+        None => {
+            let mut error: Option<String> = None;
+            loop {
+                let Some(answer) = dialog::prompt_key(&dialog::KeyPrompt {
+                    pak: &path,
+                    guid: &guid,
+                    error: error.as_deref(),
+                }) else {
+                    arc.key_declined = true;
+                    return Err(E_EABORTED);
+                };
+                match keys::AesKey::parse(&answer.text) {
+                    Ok(k) => {
+                        save_key(&folder, &guid, &k, answer.remember);
+                        break k;
+                    }
+                    Err(msg) => error = Some(msg.to_string()),
+                }
+            }
+        }
+    };
+    arc.set_key(&key).map_err(|e| {
+        dlog!("  re-reading index with key failed: {e}");
+        E_BAD_ARCHIVE
+    })
+}
+
 fn open_impl(name: Option<String>, mode: c_int, result: &mut c_int) -> Handle {
     init();
     let Some(name) = name else {
@@ -238,7 +389,7 @@ fn open_impl(name: Option<String>, mode: c_int, result: &mut c_int) -> Handle {
         }
     }
     let started = std::time::Instant::now();
-    match Archive::open(&path, &options) {
+    match open_with_keys(&path, &options) {
         Ok(arc) => {
             dlog!(
                 "  opened in {} ms: version={:?} mount={:?} entries={} skipped_unsafe={} compression={:?} encrypted_index={}",
@@ -270,14 +421,8 @@ fn open_impl(name: Option<String>, mode: c_int, result: &mut c_int) -> Handle {
                 OpenError::Io(io) if io.kind() == io::ErrorKind::NotFound => E_EOPEN,
                 OpenError::Io(io) if io.kind() == io::ErrorKind::PermissionDenied => E_EOPEN,
                 OpenError::Io(_) => E_EREAD,
-                OpenError::Encrypted => {
-                    show_warning(&format!(
-                        "{}\n\nThe pak index is AES-encrypted. Key support is not implemented \
-                         in this build yet.",
-                        path.display()
-                    ));
-                    E_NOT_SUPPORTED
-                }
+                OpenError::Encrypted | OpenError::WrongKey => E_NOT_SUPPORTED,
+                OpenError::Cancelled => E_EABORTED,
                 OpenError::Unsupported(v) => {
                     show_warning(&format!(
                         "{}\n\nPAK version {v} is newer than this plugin supports.",
@@ -290,7 +435,7 @@ fn open_impl(name: Option<String>, mode: c_int, result: &mut c_int) -> Handle {
                 OpenError::Pak(_) => E_BAD_ARCHIVE,
             };
             dlog!("  -> {}", code_name(*result));
-            if !matches!(e, OpenError::Encrypted | OpenError::Unsupported(_)) {
+            if !matches!(e, OpenError::Cancelled | OpenError::Unsupported(_)) {
                 log::on_error();
             }
             std::ptr::null_mut()
@@ -342,6 +487,12 @@ fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) -> c_int {
             dest
         );
     }
+    if arc.current_item().is_some_and(|i| i.info.encrypted) {
+        if let Err(code) = ensure_entry_key(arc) {
+            dlog!("  -> {} (no key for encrypted entry)", code_name(code));
+            return code;
+        }
+    }
     let started = std::time::Instant::now();
     let result = match op {
         PK_TEST => {
@@ -375,6 +526,10 @@ fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) -> c_int {
         }
         Err(ExtractError::Read(repak::Error::Encrypted | repak::Error::Encryption)) => {
             E_NOT_SUPPORTED
+        }
+        Err(ExtractError::Read(_)) if arc.current_item().is_some_and(|i| i.info.encrypted) => {
+            dlog!("  decrypting failed: the remembered key may not match this pak's entries");
+            E_BAD_DATA
         }
         Err(ExtractError::Read(_)) => E_BAD_DATA,
     };

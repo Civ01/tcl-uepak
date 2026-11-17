@@ -217,9 +217,11 @@ fn sample_paks() {
     for p in paths {
         let sniff = archive::sniff_footer(&p).expect("footer");
         if sniff.encrypted_index == Some(true) {
-            assert_eq!(list(&p).err(), Some(E_NOT_SUPPORTED), "{}", p.display());
+            let _g = KEY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+            crate::dialog::TEST_ANSWERS.lock().unwrap().clear();
+            assert_eq!(list(&p).err(), Some(E_EABORTED), "{}", p.display());
             println!(
-                "{}: encrypted index -> E_NOT_SUPPORTED (expected)",
+                "{}: encrypted, no key -> prompt cancelled (expected)",
                 p.display()
             );
             continue;
@@ -319,12 +321,15 @@ fn v12_pak_lists_and_extracts() {
 }
 
 #[test]
-fn encrypted_index_is_reported_as_not_supported() {
+fn encrypted_index_without_key_prompts() {
+    let _g = KEY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::dialog::TEST_ANSWERS.lock().unwrap().clear();
     // Flip the "encrypted index" byte that precedes the magic.
     let pak = patched_pak("enc", |b, pos| b[pos - 1] = 1);
     let sniff = archive::sniff_footer(&pak).unwrap();
     assert_eq!(sniff.encrypted_index, Some(true));
-    assert_eq!(list(&pak).err(), Some(E_NOT_SUPPORTED));
+    // no answer queued = the user cancels the prompt
+    assert_eq!(list(&pak).err(), Some(E_EABORTED));
 }
 
 #[test]
@@ -359,4 +364,130 @@ fn debug_open_env_pak() {
     crate::log::configure(true);
     crate::log_environment(&crate::config::Options::default());
     println!("list result: {:?}", list(Path::new(&p)).map(|l| l.len()));
+}
+
+const TEST_KEY_B64: &str = "lNJbw660IOC+kU7cnVQ1oeqrXyhk4J6UAZrCBbcnp94=";
+
+fn testdata(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata")
+        .join(name)
+}
+
+fn answer(a: Option<(&str, bool)>) {
+    crate::dialog::TEST_ANSWERS
+        .lock()
+        .unwrap()
+        .push(a.map(|(t, r)| (t.to_string(), r)));
+}
+
+/// Serialises tests that use the prompt queue / key stores.
+static KEY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn copy_to_tmp(name: &str, src: &Path) -> PathBuf {
+    let dir = tmp(name);
+    let p = dir.join(src.file_name().unwrap());
+    std::fs::copy(src, &p).unwrap();
+    p
+}
+
+fn keys_file() -> PathBuf {
+    crate::config::settings_dir()
+        .unwrap()
+        .join(crate::keys::KEYS_NAME)
+}
+
+#[test]
+fn encrypted_index_prompts_validates_and_remembers() {
+    let _g = KEY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::keys::clear_session();
+    let _ = std::fs::remove_file(keys_file());
+    crate::dialog::TEST_ANSWERS.lock().unwrap().clear();
+    let pak = copy_to_tmp("enc-index", &testdata("enc_index.pak"));
+
+    // cancel -> E_EABORTED, and no second prompt right after
+    answer(None);
+    assert_eq!(list(&pak).err(), Some(E_EABORTED));
+    assert_eq!(list(&pak).err(), Some(E_EABORTED));
+    assert!(crate::dialog::TEST_ANSWERS.lock().unwrap().is_empty());
+    super::DECLINED.lock().unwrap().clear();
+
+    // bad format, then wrong key, then the right one (session only)
+    answer(Some(("12345", false)));
+    answer(Some((&"11".repeat(32), false)));
+    answer(Some((TEST_KEY_B64, false)));
+    let listed = list(&pak).unwrap();
+    assert_eq!(listed.len(), 4);
+    assert!(crate::dialog::TEST_ANSWERS.lock().unwrap().is_empty());
+    assert!(!keys_file().exists(), "not persisted without 'remember'");
+
+    // session cache: no prompt for the extract pass
+    let out = extract_all(&pak, &pak.parent().unwrap().join("out"));
+    assert_eq!(out.len(), 4);
+
+    // remembered key, then a fresh session: found in the file, also for a subfolder
+    crate::keys::clear_session();
+    answer(Some((TEST_KEY_B64, true)));
+    assert_eq!(list(&pak).unwrap().len(), 4);
+    let saved = std::fs::read_to_string(keys_file()).unwrap();
+    assert!(saved.contains("\"format\": 1"), "{saved}");
+    crate::keys::clear_session();
+    let sub = pak.parent().unwrap().join("~mods");
+    std::fs::create_dir_all(&sub).unwrap();
+    let pak2 = sub.join("enc_index.pak");
+    std::fs::copy(&pak, &pak2).unwrap();
+    assert_eq!(list(&pak2).unwrap().len(), 4, "parent folder's key applies");
+    assert!(crate::dialog::TEST_ANSWERS.lock().unwrap().is_empty());
+
+    // a corrupt keys file is set aside, not fatal
+    std::fs::write(keys_file(), "{ not json").unwrap();
+    crate::keys::clear_session();
+    answer(None);
+    assert_eq!(list(&pak).err(), Some(E_EABORTED));
+    assert!(keys_file().with_extension("json.bad").exists());
+    let _ = std::fs::remove_file(keys_file().with_extension("json.bad"));
+    let _ = std::fs::remove_file(keys_file());
+    super::DECLINED.lock().unwrap().clear();
+}
+
+#[test]
+fn encrypted_entries_ask_for_key_on_extract() {
+    let _g = KEY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::keys::clear_session();
+    let _ = std::fs::remove_file(keys_file());
+    crate::dialog::TEST_ANSWERS.lock().unwrap().clear();
+    let pak = copy_to_tmp("enc-entries", &testdata("enc_entries.pak"));
+    // listing needs no key
+    assert_eq!(list(&pak).unwrap().len(), 4);
+    assert!(crate::dialog::TEST_ANSWERS.lock().unwrap().is_empty());
+    // extraction asks once, then all entries come out right
+    answer(Some((TEST_KEY_B64, false)));
+    let out = extract_all(&pak, &pak.parent().unwrap().join("out"));
+    assert_eq!(out.len(), 4);
+    let txt = out.iter().find(|(n, _)| n.ends_with("test.txt")).unwrap();
+    assert_eq!(
+        txt.1,
+        std::fs::read(testdata("test.txt")).unwrap(),
+        "decrypted"
+    );
+    crate::keys::clear_session();
+}
+
+/// Optional: real encrypted pak + its key, from the environment only
+/// (`UEPAK_KEYED_PAK=<file>`, `UEPAK_KEYED_KEY=<key>`); keys never committed.
+#[test]
+fn real_encrypted_pak_from_env() {
+    let (Ok(p), Ok(k)) = (
+        std::env::var("UEPAK_KEYED_PAK"),
+        std::env::var("UEPAK_KEYED_KEY"),
+    ) else {
+        return;
+    };
+    let _g = KEY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::keys::clear_session();
+    let pak = copy_to_tmp("real-enc", Path::new(&p));
+    answer(Some((&k, false)));
+    let listed = list(&pak).unwrap();
+    println!("{}: {} entries listed with key", p, listed.len());
+    crate::keys::clear_session();
 }

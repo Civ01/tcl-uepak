@@ -3,7 +3,8 @@
 Total Commander 11+ packer plugin (WCX, **x64 only**) for Unreal Engine `.pak` files.
 Built in Rust on a fork of [repak](https://github.com/Civ01/repak).
 
-Status: **read-only skeleton** — list, extract (F5), test. No packing, no AES keys yet.
+Status: **reading** — list, extract (F5), test, AES-encrypted paks (key prompt, remembered
+keys). Packing: calls are recorded but not implemented yet (see SPEC.md).
 
 ## Install
 
@@ -25,6 +26,14 @@ deps\            third-party codec DLLs, e.g. oo2core_9_win64.dll for Oodle
 |---|---|
 | none, Zlib, Gzip, Zstd, LZ4 | built in |
 | Oodle | needs `oo2core_N_win64.dll` in `deps\` (any version; highest wins). Missing → warning, listing still works |
+
+## AES keys
+
+Opening a pak with an encrypted file list asks for its key (64 hex digits, optional `0x`, or
+base64). A wrong key is detected and the dialog asks again. With "Remember" ticked the key
+is stored in `uepak.keys.json` (settings folder) for that folder and its subfolders; a key
+for a non-zero key GUID is also tried for paks with the same GUID elsewhere. Keys are never
+written to the log. Encrypted paks can't be modified.
 
 ## Options (`uepak.ini`)
 

@@ -15,6 +15,10 @@ pub enum OpenError {
     Encrypted,
     /// Footer recognised, but the version is newer than repak knows.
     Unsupported(u32),
+    /// A key was given but does not decrypt the index (SHA-1 mismatch).
+    WrongKey,
+    /// The user cancelled the key prompt.
+    Cancelled,
     Pak(repak::Error),
 }
 
@@ -24,6 +28,8 @@ impl std::fmt::Display for OpenError {
             OpenError::Io(e) => write!(f, "{e}"),
             OpenError::Encrypted => write!(f, "the pak index is encrypted (AES key needed)"),
             OpenError::Unsupported(v) => write!(f, "pak version {v} is not supported"),
+            OpenError::WrongKey => write!(f, "the AES key does not match this pak"),
+            OpenError::Cancelled => write!(f, "cancelled by the user"),
             OpenError::Pak(e) => write!(f, "{e}"),
         }
     }
@@ -50,6 +56,10 @@ pub struct Archive {
     pub mtime: Option<std::time::SystemTime>,
     /// Set once the "Oodle missing" warning was shown for this handle.
     pub oodle_warned: bool,
+    /// Key the pak was opened with, if any.
+    pub key: Option<crate::keys::AesKey>,
+    /// Set once a key prompt for encrypted entries was cancelled on this handle.
+    pub key_declined: bool,
 }
 
 /// Turns `../../../Game/Content/` into `Game\Content` (empty if nothing left).
@@ -70,16 +80,32 @@ fn is_safe_relative(path: &str) -> bool {
 }
 
 impl Archive {
-    pub fn open(path: &Path, options: &Options) -> Result<Self, OpenError> {
+    fn read_pak(
+        reader: &mut BufReader<File>,
+        key: Option<&crate::keys::AesKey>,
+    ) -> Result<PakReader, OpenError> {
+        let mut builder = repak::PakBuilder::new();
+        if let Some(k) = key {
+            builder = builder.key(k.cipher());
+        }
+        match builder.reader(reader) {
+            Ok(pak) => Ok(pak),
+            Err(repak::Error::Encrypted) => Err(OpenError::Encrypted),
+            Err(repak::Error::WrongKey) => Err(OpenError::WrongKey),
+            Err(repak::Error::UnsupportedVersion(v)) => Err(OpenError::Unsupported(v)),
+            Err(e) => Err(OpenError::Pak(e)),
+        }
+    }
+
+    pub fn open(
+        path: &Path,
+        options: &Options,
+        key: Option<&crate::keys::AesKey>,
+    ) -> Result<Self, OpenError> {
         let file = File::open(path).map_err(OpenError::Io)?;
         let mtime = file.metadata().and_then(|m| m.modified()).ok();
         let mut reader = BufReader::new(file);
-        let pak = match repak::PakBuilder::new().reader(&mut reader) {
-            Ok(pak) => pak,
-            Err(repak::Error::Encrypted) => return Err(OpenError::Encrypted),
-            Err(repak::Error::UnsupportedVersion(v)) => return Err(OpenError::Unsupported(v)),
-            Err(e) => return Err(OpenError::Pak(e)),
-        };
+        let pak = Self::read_pak(&mut reader, key)?;
 
         let prefix = match options.mount_point {
             MountPointMode::Root => String::new(),
@@ -112,7 +138,17 @@ impl Archive {
             current: None,
             mtime,
             oodle_warned: false,
+            key: key.copied(),
+            key_declined: false,
         })
+    }
+
+    /// Re-reads the index with `key` (for paks whose index is plain but whose
+    /// entries are encrypted). Listing state and position are kept.
+    pub fn set_key(&mut self, key: &crate::keys::AesKey) -> Result<(), OpenError> {
+        self.pak = Self::read_pak(&mut self.reader, Some(key))?;
+        self.key = Some(*key);
+        Ok(())
     }
 
     pub fn pak(&self) -> &PakReader {

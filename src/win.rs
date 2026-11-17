@@ -113,18 +113,26 @@ mod imp {
         }
     }
 
-    /// Full path of this DLL (not of TOTALCMD64.EXE).
-    pub fn module_path() -> Option<PathBuf> {
+    /// Handle of this DLL (not of TOTALCMD64.EXE); null on failure.
+    pub fn module_handle() -> HMODULE {
+        let mut module: HMODULE = std::ptr::null_mut();
+        let anchor = module_handle as *const u16;
         unsafe {
-            let mut module: HMODULE = std::ptr::null_mut();
-            let anchor = module_path as *const u16;
-            if GetModuleHandleExW(
+            GetModuleHandleExW(
                 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
                     | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                 anchor,
                 &mut module,
-            ) == 0
-            {
+            );
+        }
+        module
+    }
+
+    /// Full path of this DLL (not of TOTALCMD64.EXE).
+    pub fn module_path() -> Option<PathBuf> {
+        unsafe {
+            let module = module_handle();
+            if module.is_null() {
                 return None;
             }
             let mut buf = vec![0u16; 32768];

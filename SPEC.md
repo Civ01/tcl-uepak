@@ -20,7 +20,10 @@ behaviour that already exists in the skeleton; everything else is planned.
 **Non-goals**
 
 - IoStore containers (`.utoc` / `.ucas`). Separate project.
-- Writing encrypted paks or encrypted entries. Encryption is **read-only**.
+- Writing encrypted paks or encrypted entries. Encryption is **read-only**: keys are only
+  used to read. (An AES key is symmetric and could encrypt too, but mods don't need
+  encrypted paks, and games that verify paks do it with signatures, which a key doesn't
+  provide.) Modifying an encrypted pak is refused.
 - Pak signing (`.sig` files). A modified signed pak will fail signature checks in games
   that enforce them; this is documented, not handled.
 - 32-bit Total Commander.
@@ -144,7 +147,7 @@ used, and maps `PackFiles` / `DeleteFiles` paths with that mode. Switching the m
 Set `PK_CAPS_SEARCHTEXT` so TC's "Find files → search in archives" with text works. TC
 extracts each candidate through `ProcessFile`, so this needs no extra code.
 
-### 3.5 AES keys (planned)
+### 3.5 AES keys **[done]**
 
 **When a key is needed:** the index is encrypted, or an entry being extracted is encrypted.
 
@@ -158,8 +161,12 @@ extracts each candidate through `ProcessFile`, so this needs no extra code.
    (A zero GUID identifies nothing: every game's main key has it.)
 3. Otherwise, show the key dialog.
 
-A key is valid if it decrypts the index (or entry) into something that parses. A wrong key
-re-opens the dialog with "Key does not match this pak".
+**Validation:** the footer stores the SHA-1 of the *decrypted* index (verified on real
+paks; Unreal checks the same). After decrypting, the fork compares hashes before parsing
+anything, so a wrong key is a clean `WrongKey` error, never garbage parsing. The dialog
+then re-opens with "This key does not match this pak". Entry-only encryption (plain index)
+can't be validated up front: the first matching remembered key is used, and a decode
+failure is logged as "key may not match".
 
 **Key dialog** (modal, parent = TC window):
 
@@ -168,8 +175,14 @@ re-opens the dialog with "Key does not match this pak".
 - Shows the pak name, its folder and its key GUID.
 - Checkbox **"Remember for this folder"**, on by default.
 - OK / Cancel. Cancel means the open fails quietly (`E_EABORTED`, no second message).
-- Listing mode and extract mode use the same dialog. During one TC operation the
-  dialog is shown at most once per pak, so a multi-file extract doesn't prompt per file.
+- Listing mode and extract mode use the same dialog. Every key that works is kept in a
+  session cache (until TC exits) even when "Remember" is off, so the extract pass after a
+  listing doesn't ask again. After Cancel, the same pak isn't prompted again for 10 s
+  (TC opens a pak several times per operation).
+- For a plain index with encrypted entries, listing needs no key; the prompt appears on
+  the first extraction of an encrypted entry, at most once per opened archive.
+- Built from an in-memory dialog template (no resource compiler); tested under Wine by
+  driving the real dialog (bad format → wrong key → right key).
 
 **Storage:** `uepak.keys.json` in the settings directory, separate from `uepak.ini`:
 
