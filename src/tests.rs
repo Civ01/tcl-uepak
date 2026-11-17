@@ -342,6 +342,8 @@ fn future_version_is_reported_as_unknown_format() {
 
 #[test]
 fn debug_log_writes_to_plugin_dir() {
+    // pin logging on: other tests reload options (DebugLog=0) concurrently
+    crate::log::FORCE.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::log::configure(true);
     crate::dlog!("hello from test {}", 42);
     let path = crate::config::plugin_dir()
@@ -766,4 +768,42 @@ fn pack_cancel_removes_partial_pak() {
     assert!(!pak.exists());
     assert!(!pak.with_file_name("cancel.pak.uepak-tmp").exists());
     assert!(src.join("a.txt").exists(), "sources untouched");
+}
+
+/// Byte-for-byte parity with a reference pak made by repak / UnrealPak:
+/// `UEPAK_PARITY_PAK=<ref.pak>` is unpacked, re-packed by the plugin with the
+/// same version, mount point and (no) compression, and compared.
+#[test]
+fn parity_with_reference_pak() {
+    use crate::config::PackOptions;
+    let Ok(reference) = std::env::var("UEPAK_PARITY_PAK") else {
+        return;
+    };
+    let reference = PathBuf::from(reference);
+    let mut f = std::io::BufReader::new(std::fs::File::open(&reference).unwrap());
+    let r = repak::PakBuilder::new().reader(&mut f).unwrap();
+    let src = tmp("parity").join("src");
+    let mut add = vec![];
+    for p in r.files() {
+        let dest = src.join(&p);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, r.get(&p, &mut f).unwrap()).unwrap();
+        add.push(p.replace('/', "\\\\"));
+    }
+    let opts = PackOptions {
+        mount_point: r.mount_point().to_string(),
+        version: r.version(),
+        ..PackOptions::default()
+    };
+    let out = src.parent().unwrap().join("plugin.pak");
+    assert_eq!(crate::pack_files(&out, None, &src, &add, 2, &opts), 0);
+    let a = std::fs::read(&reference).unwrap();
+    let b = std::fs::read(&out).unwrap();
+    println!(
+        "reference {} bytes, plugin {} bytes, identical: {}",
+        a.len(),
+        b.len(),
+        a == b
+    );
+    assert_eq!(a, b, "byte-identical");
 }

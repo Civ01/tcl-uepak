@@ -260,8 +260,10 @@ TC passes no per-operation settings to `PackFiles`; the current settings (`uepak
   then the listed folders are removed if empty (deepest first).
 - Unsafe entry paths (`..`, absolute, `:`) are refused.
 - Entries are written sorted by path (deterministic output).
-- Mount point normalisation: `\` → `/`, trailing `/` added, empty → `../../../`; otherwise
-  written as typed (`/Game/` style works).
+- Mount point normalisation: `\` → `/`, empty → `../../../`; otherwise written exactly as
+  typed, with no trailing `/` added (Unreal adds it when mounting; real UE paks exist both
+  ways). This keeps output byte-identical to repak: verified against a repak-made pak
+  (`UEPAK_PARITY_PAK` test).
 
 #### 4.2.1 Existing paks: view path → entry path (M1)
 

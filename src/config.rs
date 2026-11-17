@@ -124,16 +124,15 @@ pub fn parse_size(v: &str) -> Option<u32> {
         .then_some(bytes as u32)
 }
 
-/// Normalises a mount point: `\` -> `/`, trailing `/`, empty -> `../../../`.
+/// Normalises a mount point: `\\` -> `/`, empty -> `../../../`, otherwise as
+/// typed (no trailing `/` added: Unreal adds it when mounting, and keeping
+/// the text as typed makes output byte-identical to repak).
 pub fn normalize_mount(v: &str) -> String {
     let v = v.trim().replace('\\', "/");
     if v.is_empty() {
-        return DEFAULT_PACK_MOUNT.into();
-    }
-    if v.ends_with('/') {
-        v
+        DEFAULT_PACK_MOUNT.into()
     } else {
-        format!("{v}/")
+        v
     }
 }
 
@@ -328,7 +327,7 @@ mod tests {
         let o = parse_options(
             "[Pack]\nMountPoint=..\\..\\..\\Townfall\\Config\nVersion=v12\nCompression=Oodle\nBlockSize=128K",
         );
-        assert_eq!(o.pack.mount_point, "../../../Townfall/Config/");
+        assert_eq!(o.pack.mount_point, "../../../Townfall/Config");
         assert_eq!(o.pack.version, repak::Version::V12);
         assert_eq!(o.pack.compression, PackCompression::Oodle);
         assert_eq!(o.pack.block_size, 131072);
