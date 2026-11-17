@@ -1,0 +1,236 @@
+//! Unit tests that drive the exported WCX functions the way Total Commander does.
+//! Sample paks from real games are not committed; set UEPAK_SAMPLES to a
+//! folder with *.pak files to include them.
+
+use crate::ffi::*;
+use crate::*;
+use std::path::{Path, PathBuf};
+
+fn wide(s: &str) -> Vec<u16> {
+    win::wide(s)
+}
+
+struct Listed {
+    name: String,
+    pack: u64,
+    unpack: u64,
+}
+
+fn list(path: &Path) -> Result<Vec<Listed>, i32> {
+    let name = wide(&path.to_string_lossy());
+    let mut data = OpenArchiveDataW {
+        ArcName: name.as_ptr(),
+        OpenMode: PK_OM_LIST,
+        OpenResult: 0,
+        CmtBuf: std::ptr::null_mut(),
+        CmtBufSize: 0,
+        CmtSize: 0,
+        CmtState: 0,
+    };
+    let h = unsafe { OpenArchiveW(&mut data) };
+    if h.is_null() {
+        return Err(data.OpenResult);
+    }
+    let mut out = vec![];
+    loop {
+        let mut hd: Box<HeaderDataExW> = unsafe { Box::new(std::mem::zeroed()) };
+        let r = unsafe { ReadHeaderExW(h, &mut *hd) };
+        if r == E_END_ARCHIVE {
+            break;
+        }
+        assert_eq!(r, 0);
+        let end = hd.FileName.iter().position(|&c| c == 0).unwrap();
+        out.push(Listed {
+            name: String::from_utf16(&hd.FileName[..end]).unwrap(),
+            pack: hd.PackSize as u64 | (hd.PackSizeHigh as u64) << 32,
+            unpack: hd.UnpSize as u64 | (hd.UnpSizeHigh as u64) << 32,
+        });
+        assert_eq!(
+            unsafe { ProcessFileW(h, PK_SKIP, std::ptr::null(), std::ptr::null()) },
+            0
+        );
+    }
+    assert_eq!(unsafe { CloseArchive(h) }, 0);
+    Ok(out)
+}
+
+/// Extracts every entry; returns (name, bytes) pairs.
+fn extract_all(path: &Path, dest: &Path) -> Vec<(String, Vec<u8>)> {
+    let name = wide(&path.to_string_lossy());
+    let mut data = OpenArchiveDataW {
+        ArcName: name.as_ptr(),
+        OpenMode: PK_OM_EXTRACT,
+        OpenResult: 0,
+        CmtBuf: std::ptr::null_mut(),
+        CmtBufSize: 0,
+        CmtSize: 0,
+        CmtState: 0,
+    };
+    let h = unsafe { OpenArchiveW(&mut data) };
+    assert!(!h.is_null(), "open failed: {}", data.OpenResult);
+    let mut out = vec![];
+    loop {
+        let mut hd: Box<HeaderDataExW> = unsafe { Box::new(std::mem::zeroed()) };
+        if unsafe { ReadHeaderExW(h, &mut *hd) } == E_END_ARCHIVE {
+            break;
+        }
+        let end = hd.FileName.iter().position(|&c| c == 0).unwrap();
+        let rel = String::from_utf16(&hd.FileName[..end]).unwrap();
+        let target = dest.join(rel.replace('\\', "/"));
+        let target_w = wide(&target.to_string_lossy());
+        let r = unsafe { ProcessFileW(h, PK_EXTRACT, std::ptr::null(), target_w.as_ptr()) };
+        assert_eq!(r, 0, "extract {rel}");
+        assert_eq!(
+            unsafe { ProcessFileW(h, PK_TEST, std::ptr::null(), std::ptr::null()) },
+            0
+        );
+        out.push((rel, std::fs::read(&target).unwrap()));
+    }
+    unsafe { CloseArchive(h) };
+    out
+}
+
+fn tmp(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("uepak-test-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn make_pak(path: &Path, compression: Option<repak::Compression>, files: &[(&str, Vec<u8>)]) {
+    let f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let mut b = repak::PakBuilder::new();
+    if let Some(c) = compression {
+        b = b.compression([c]);
+    }
+    let mut w = b.writer(
+        f,
+        repak::Version::V11,
+        "../../../TestGame/Content/".into(),
+        None,
+    );
+    for (name, data) in files {
+        w.write_file(name, compression.is_some(), data).unwrap();
+    }
+    w.write_index().unwrap();
+}
+
+fn payload() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("Maps/Test.umap", b"umap".repeat(5000)),
+        (
+            "Config/DefaultGame.ini",
+            b"[/Script/Engine]\nfoo=bar\n".to_vec(),
+        ),
+        ("Empty.bin", vec![]),
+        ("Big/zeros.bin", vec![0u8; 3 * 65536 + 17]),
+    ]
+}
+
+#[test]
+fn roundtrip_synthetic_paks() {
+    for comp in [
+        None,
+        Some(repak::Compression::Zlib),
+        Some(repak::Compression::Gzip),
+        Some(repak::Compression::Zstd),
+        Some(repak::Compression::LZ4),
+    ] {
+        let dir = tmp(&format!("{comp:?}"));
+        let pak = dir.join("test.pak");
+        let files = payload();
+        make_pak(&pak, comp, &files);
+        assert!(archive::looks_like_pak(&pak));
+
+        let listed = list(&pak).unwrap();
+        assert_eq!(listed.len(), files.len(), "{comp:?}");
+        for (name, data) in &files {
+            let l = listed
+                .iter()
+                .find(|l| l.name == name.replace('/', "\\"))
+                .unwrap();
+            assert_eq!(l.unpack, data.len() as u64);
+            if comp.is_some() && !data.is_empty() && data.len() > 1000 {
+                assert!(
+                    l.pack < l.unpack,
+                    "{comp:?} {name} should be smaller packed"
+                );
+            }
+        }
+
+        let out = extract_all(&pak, &dir.join("out"));
+        for (name, data) in &files {
+            let got = out
+                .iter()
+                .find(|(n, _)| *n == name.replace('/', "\\"))
+                .unwrap();
+            assert_eq!(&got.1, data, "{comp:?} {name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn rejects_non_pak() {
+    let dir = tmp("nonpak");
+    let p = dir.join("x.pak");
+    std::fs::write(&p, vec![7u8; 4096]).unwrap();
+    assert!(!archive::looks_like_pak(&p));
+    assert!(list(&p).is_err());
+    assert_eq!(list(&dir.join("missing.pak")).err(), Some(E_EOPEN));
+}
+
+#[test]
+fn caps_are_read_only() {
+    let caps = GetPackerCaps();
+    assert_eq!(caps & (PK_CAPS_NEW | PK_CAPS_MODIFY | PK_CAPS_DELETE), 0);
+}
+
+#[test]
+fn sample_paks() {
+    let Ok(dir) = std::env::var("UEPAK_SAMPLES") else {
+        return;
+    };
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pak")) {
+            let listed = list(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            let total: u64 = listed.iter().map(|l| l.unpack).sum();
+            println!("{}: {} entries, {} bytes", p.display(), listed.len(), total);
+            let out_dir = tmp("sample");
+            let out = extract_all(&p, &out_dir);
+            assert_eq!(out.len(), listed.len());
+            for (l, (_, data)) in listed.iter().zip(&out) {
+                assert_eq!(l.unpack, data.len() as u64, "{}", l.name);
+            }
+            let _ = std::fs::remove_dir_all(&out_dir);
+        }
+    }
+}
+
+#[test]
+fn guard_turns_panic_into_fallback() {
+    let v = crate::guard(42, "test", || -> i32 { panic!("boom") });
+    assert_eq!(v, 42);
+}
+
+#[test]
+fn null_and_bad_handles_do_not_crash() {
+    unsafe {
+        assert_eq!(
+            ReadHeaderExW(std::ptr::null_mut(), std::ptr::null_mut()),
+            E_BAD_ARCHIVE
+        );
+        assert_eq!(
+            ProcessFileW(
+                std::ptr::null_mut(),
+                PK_EXTRACT,
+                std::ptr::null(),
+                std::ptr::null()
+            ),
+            E_BAD_ARCHIVE
+        );
+        assert_eq!(CloseArchive(std::ptr::null_mut()), 0);
+        assert!(OpenArchiveW(std::ptr::null_mut()).is_null());
+    }
+}

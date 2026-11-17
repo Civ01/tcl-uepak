@@ -1,0 +1,6 @@
+[plugininstall]
+description=Unreal Engine .pak archives (read-only)
+type=wcx
+file=uepak.wcx64
+defaultdir=uepak
+defaultextension=pak
