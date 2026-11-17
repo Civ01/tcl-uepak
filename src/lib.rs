@@ -8,6 +8,7 @@
 pub mod archive;
 pub mod config;
 pub mod ffi;
+pub mod log;
 pub mod win;
 
 #[cfg(test)]
@@ -38,7 +39,8 @@ fn guard<T>(fallback: T, func: &str, f: impl FnOnce() -> T) -> T {
                 .map(|s| s.to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".into());
-            win::error(&format!(
+            dlog!("PANIC in {func}: {msg}");
+            show_error(&format!(
                 "Internal error in {func}:\n{msg}\n\nThe operation was cancelled."
             ));
             fallback
@@ -53,7 +55,90 @@ fn init() {
         if let Some(deps) = config::deps_dir() {
             oodle_loader::set_search_paths([deps]);
         }
+        let default_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if log::enabled() {
+                log::write(&format!("panic: {info}"));
+            } else if cfg!(test) {
+                default_hook(info);
+            }
+        }));
     });
+    reload_options();
+}
+
+/// Re-reads `uepak.ini` (so DebugLog can be toggled without restarting TC).
+fn reload_options() -> config::Options {
+    let options = config::load_options();
+    let was_enabled = log::enabled();
+    log::configure(options.debug_log);
+    if options.debug_log && !was_enabled {
+        log_environment(&options);
+    }
+    options
+}
+
+fn log_environment(options: &config::Options) {
+    dlog!("plugin: {:?}", win::module_path());
+    dlog!("settings dir: {:?}", config::settings_dir());
+    dlog!("options: {options:?}");
+    let deps = config::deps_dir();
+    let listing = deps
+        .as_ref()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|it| {
+            it.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "<missing>".into());
+    dlog!("deps dir: {deps:?} contains: [{listing}]");
+    dlog!("oodle search paths: {:?}", oodle_loader::search_paths());
+}
+
+/// Shows a warning, appending where the debug log went (copying it to the
+/// clipboard first if it is in memory).
+fn show_warning(text: &str) {
+    match log::on_error() {
+        Some(note) => win::warn(&format!("{text}\n\n{note}")),
+        None => win::warn(text),
+    }
+}
+
+fn show_error(text: &str) {
+    match log::on_error() {
+        Some(note) => win::error(&format!("{text}\n\n{note}")),
+        None => win::error(text),
+    }
+}
+
+fn code_name(code: c_int) -> &'static str {
+    match code {
+        0 => "OK",
+        E_END_ARCHIVE => "E_END_ARCHIVE",
+        E_NO_MEMORY => "E_NO_MEMORY",
+        E_BAD_DATA => "E_BAD_DATA",
+        E_BAD_ARCHIVE => "E_BAD_ARCHIVE",
+        E_UNKNOWN_FORMAT => "E_UNKNOWN_FORMAT",
+        E_EOPEN => "E_EOPEN",
+        E_ECREATE => "E_ECREATE",
+        E_ECLOSE => "E_ECLOSE",
+        E_EREAD => "E_EREAD",
+        E_EWRITE => "E_EWRITE",
+        E_EABORTED => "E_EABORTED",
+        E_NOT_SUPPORTED => "E_NOT_SUPPORTED",
+        _ => "?",
+    }
+}
+
+fn op_name(op: c_int) -> &'static str {
+    match op {
+        PK_SKIP => "SKIP",
+        PK_TEST => "TEST",
+        PK_EXTRACT => "EXTRACT",
+        _ => "?",
+    }
 }
 
 static PROCESS_DATA_W: AtomicUsize = AtomicUsize::new(0);
@@ -82,7 +167,7 @@ fn warn_oodle_once(archive: &Path, detail: &str) {
         .insert(archive.to_path_buf())
     {
         drop(guard);
-        win::warn(&oodle_missing_text(archive, detail));
+        show_warning(&oodle_missing_text(archive, detail));
     }
 }
 
@@ -136,34 +221,78 @@ fn open_impl(name: Option<String>, mode: c_int, result: &mut c_int) -> Handle {
         return std::ptr::null_mut();
     };
     let path = PathBuf::from(name);
-    let options = config::load_options();
+    let options = reload_options();
+    dlog!(
+        "OpenArchive {} mode={}",
+        path.display(),
+        if mode == PK_OM_LIST {
+            "LIST"
+        } else {
+            "EXTRACT"
+        }
+    );
+    if log::enabled() {
+        match archive::sniff_footer(&path) {
+            Some(f) => dlog!("  footer: {f}"),
+            None => dlog!("  footer: no PAK magic in the last 512 bytes"),
+        }
+    }
+    let started = std::time::Instant::now();
     match Archive::open(&path, &options) {
         Ok(arc) => {
-            if mode == PK_OM_LIST && arc.uses_oodle() {
-                if let Err(e) = oodle_loader::oodle() {
-                    warn_oodle_once(&path, &e.to_string());
+            dlog!(
+                "  opened in {} ms: version={:?} mount={:?} entries={} skipped_unsafe={} compression={:?} encrypted_index={}",
+                started.elapsed().as_millis(),
+                arc.pak().version(),
+                arc.pak().mount_point(),
+                arc.items.len(),
+                arc.pak().files().len() - arc.items.len(),
+                arc.pak().used_compression(),
+                arc.pak().encrypted_index(),
+            );
+            if arc.uses_oodle() {
+                match oodle_loader::oodle() {
+                    Ok(o) => dlog!("  oodle: loaded {}", o.path().display()),
+                    Err(e) => {
+                        dlog!("  oodle: NOT available: {e}");
+                        if mode == PK_OM_LIST {
+                            warn_oodle_once(&path, &e.to_string());
+                        }
+                    }
                 }
             }
             *result = 0;
             Box::into_raw(Box::new(arc)) as Handle
         }
         Err(e) => {
+            dlog!("  open failed: {e}");
             *result = match &e {
                 OpenError::Io(io) if io.kind() == io::ErrorKind::NotFound => E_EOPEN,
                 OpenError::Io(io) if io.kind() == io::ErrorKind::PermissionDenied => E_EOPEN,
                 OpenError::Io(_) => E_EREAD,
                 OpenError::Encrypted => {
-                    win::warn(&format!(
+                    show_warning(&format!(
                         "{}\n\nThe pak index is AES-encrypted. Key support is not implemented \
                          in this build yet.",
                         path.display()
                     ));
                     E_NOT_SUPPORTED
                 }
+                OpenError::Unsupported(v) => {
+                    show_warning(&format!(
+                        "{}\n\nPAK version {v} is newer than this plugin supports.",
+                        path.display()
+                    ));
+                    E_UNKNOWN_FORMAT
+                }
                 OpenError::Pak(repak::Error::Magic(_))
                 | OpenError::Pak(repak::Error::UnsupportedOrEncrypted(_)) => E_UNKNOWN_FORMAT,
                 OpenError::Pak(_) => E_BAD_ARCHIVE,
             };
+            dlog!("  -> {}", code_name(*result));
+            if !matches!(e, OpenError::Encrypted | OpenError::Unsupported(_)) {
+                log::on_error();
+            }
             std::ptr::null_mut()
         }
     }
@@ -178,7 +307,13 @@ struct HeaderOut {
 
 fn next_header(arc: &mut Archive) -> Option<HeaderOut> {
     let time = arc.mtime.map(win::dos_time).unwrap_or(0);
-    let item = arc.next_item()?;
+    let Some(item) = arc.next_item() else {
+        dlog!(
+            "ReadHeader: end of archive after {} entries",
+            arc.items.len()
+        );
+        return None;
+    };
     Some(HeaderOut {
         name: item.display.clone(),
         pack: item.info.compressed_size,
@@ -195,6 +330,19 @@ fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) -> c_int {
         .current_item()
         .map(|i| i.display.clone())
         .unwrap_or_default();
+    if let Some(item) = arc.current_item() {
+        dlog!(
+            "ProcessFile {} {} packed={} unpacked={} compression={:?} encrypted={} dest={:?}",
+            op_name(op),
+            item.pak_path,
+            item.info.compressed_size,
+            item.info.uncompressed_size,
+            item.info.compression,
+            item.info.encrypted,
+            dest
+        );
+    }
+    let started = std::time::Instant::now();
     let result = match op {
         PK_TEST => {
             let mut out = Progress {
@@ -210,7 +358,10 @@ fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) -> c_int {
         }
         _ => return E_NOT_SUPPORTED,
     };
-    match result {
+    if let Err(e) = &result {
+        dlog!("  failed after {} ms: {e:?}", started.elapsed().as_millis());
+    }
+    let code = match result {
         Ok(()) => 0,
         Err(ExtractError::Aborted) => E_EABORTED,
         Err(ExtractError::Create(_)) => E_ECREATE,
@@ -218,7 +369,7 @@ fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) -> c_int {
         Err(ExtractError::Read(repak::Error::OodleFailed(e))) => {
             if !arc.oodle_warned {
                 arc.oodle_warned = true;
-                win::warn(&oodle_missing_text(&arc.path, &e.to_string()));
+                show_warning(&oodle_missing_text(&arc.path, &e.to_string()));
             }
             E_NOT_SUPPORTED
         }
@@ -226,7 +377,16 @@ fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) -> c_int {
             E_NOT_SUPPORTED
         }
         Err(ExtractError::Read(_)) => E_BAD_DATA,
+    };
+    if code == 0 {
+        dlog!("  ok in {} ms", started.elapsed().as_millis());
+    } else {
+        dlog!("  -> {}", code_name(code));
+        if code != E_EABORTED {
+            log::on_error();
+        }
     }
+    code
 }
 
 fn join_dest(path: Option<String>, name: Option<String>) -> Option<PathBuf> {
@@ -297,7 +457,9 @@ unsafe fn dest_path_w(dir: *const u16, name: *const u16) -> Option<PathBuf> {
 pub unsafe extern "system" fn CloseArchive(h: Handle) -> c_int {
     guard(E_ECLOSE, "CloseArchive", || {
         if !h.is_null() {
-            drop(Box::from_raw(h as *mut Archive));
+            let arc = Box::from_raw(h as *mut Archive);
+            dlog!("CloseArchive {}", arc.path.display());
+            drop(arc);
         }
         0
     })

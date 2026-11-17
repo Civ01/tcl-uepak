@@ -137,6 +137,58 @@ mod imp {
         ((date as u32) << 16 | time as u32) as i32
     }
 
+    /// Local wall-clock time as `YYYY-MM-DD HH:MM:SS.mmm`.
+    pub fn local_timestamp() -> String {
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+        let mut t: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+        unsafe { GetLocalTime(&mut t) };
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+        )
+    }
+
+    pub fn thread_id() -> u32 {
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+    }
+
+    /// Puts `text` on the clipboard as Unicode text. Returns success.
+    pub fn copy_to_clipboard(text: &str) -> bool {
+        use windows_sys::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        };
+        use windows_sys::Win32::System::Memory::{
+            GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+        };
+        use windows_sys::Win32::Foundation::GlobalFree;
+        const CF_UNICODETEXT: u32 = 13;
+        let data = wide(&text.replace("\r\n", "\n").replace('\n', "\r\n"));
+        let bytes = data.len() * 2;
+        unsafe {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return false;
+            }
+            let mut ok = false;
+            if EmptyClipboard() != 0 {
+                let mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+                if !mem.is_null() {
+                    let dst = GlobalLock(mem) as *mut u16;
+                    if !dst.is_null() {
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+                        GlobalUnlock(mem);
+                        // On success the clipboard owns the memory.
+                        ok = !SetClipboardData(CF_UNICODETEXT, mem as _).is_null();
+                    }
+                    if !ok {
+                        GlobalFree(mem);
+                    }
+                }
+            }
+            CloseClipboard();
+            ok
+        }
+    }
+
     /// ANSI (CP_ACP) C string -> String.
     ///
     /// # Safety
@@ -192,6 +244,21 @@ mod imp {
 
     pub fn dos_time(_t: SystemTime) -> i32 {
         0
+    }
+
+    pub fn local_timestamp() -> String {
+        let d = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{}.{:03}", d.as_secs(), d.subsec_millis())
+    }
+
+    pub fn thread_id() -> u32 {
+        0
+    }
+
+    pub fn copy_to_clipboard(_text: &str) -> bool {
+        false
     }
 
     /// # Safety

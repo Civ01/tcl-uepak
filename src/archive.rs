@@ -13,6 +13,8 @@ pub enum OpenError {
     Io(io::Error),
     /// Index is AES-encrypted and no key is available.
     Encrypted,
+    /// Footer recognised, but the version is newer than repak knows.
+    Unsupported(u32),
     Pak(repak::Error),
 }
 
@@ -21,6 +23,7 @@ impl std::fmt::Display for OpenError {
         match self {
             OpenError::Io(e) => write!(f, "{e}"),
             OpenError::Encrypted => write!(f, "the pak index is encrypted (AES key needed)"),
+            OpenError::Unsupported(v) => write!(f, "pak version {v} is not supported"),
             OpenError::Pak(e) => write!(f, "{e}"),
         }
     }
@@ -74,6 +77,7 @@ impl Archive {
         let pak = match repak::PakBuilder::new().reader(&mut reader) {
             Ok(pak) => pak,
             Err(repak::Error::Encrypted) => return Err(OpenError::Encrypted),
+            Err(repak::Error::UnsupportedVersion(v)) => return Err(OpenError::Unsupported(v)),
             Err(e) => return Err(OpenError::Pak(e)),
         };
 
@@ -109,6 +113,10 @@ impl Archive {
             mtime,
             oodle_warned: false,
         })
+    }
+
+    pub fn pak(&self) -> &PakReader {
+        &self.pak
     }
 
     pub fn uses_oodle(&self) -> bool {
@@ -214,24 +222,99 @@ impl ExtractError {
     }
 }
 
+/// Raw footer fields, read independently of repak (for detection and logs).
+#[derive(Debug, Default)]
+pub struct FooterSniff {
+    pub file_size: u64,
+    /// Offset of the magic from the end of the file.
+    pub magic_from_end: u64,
+    pub version: u32,
+    pub encrypted_index: Option<bool>,
+    pub key_guid: Option<String>,
+    pub index_offset: u64,
+    pub index_size: u64,
+    pub compression: Vec<String>,
+}
+
+impl std::fmt::Display for FooterSniff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "size={} version={} encrypted_index={:?} key_guid={} index@{}+{} magic_from_end={} compression=[{}]",
+            self.file_size,
+            self.version,
+            self.encrypted_index,
+            self.key_guid.as_deref().unwrap_or("-"),
+            self.index_offset,
+            self.index_size,
+            self.magic_from_end,
+            self.compression.join(", ")
+        )
+    }
+}
+
+/// Finds the PAK footer magic in the last 512 bytes and decodes the fields
+/// around it. `None` if there is no magic (not a standard pak).
+pub fn sniff_footer(path: &Path) -> Option<FooterSniff> {
+    let mut f = File::open(path).ok()?;
+    let len = f.seek(SeekFrom::End(0)).ok()?;
+    let tail = len.min(512);
+    if tail < 44 {
+        return None;
+    }
+    f.seek(SeekFrom::Start(len - tail)).ok()?;
+    let mut buf = vec![0; tail as usize];
+    f.read_exact(&mut buf).ok()?;
+    let magic = PAK_MAGIC.to_le_bytes();
+    let pos = buf.windows(4).rposition(|w| w == magic)?;
+    let u32_at = |o: usize| {
+        buf.get(o..o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let u64_at = |o: usize| {
+        buf.get(o..o + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    };
+    let version = u32_at(pos + 4)?;
+    let mut s = FooterSniff {
+        file_size: len,
+        magic_from_end: tail - pos as u64,
+        version,
+        index_offset: u64_at(pos + 8).unwrap_or(0),
+        index_size: u64_at(pos + 16).unwrap_or(0),
+        ..Default::default()
+    };
+    if version >= 4 && pos >= 1 {
+        s.encrypted_index = Some(buf[pos - 1] != 0);
+    }
+    if version >= 7 && pos >= 17 {
+        s.key_guid = Some(
+            buf[pos - 17..pos - 1]
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect(),
+        );
+    }
+    if version >= 8 {
+        let mut o = pos + 4 + 4 + 8 + 8 + 20 + usize::from(version == 9);
+        while let Some(name) = buf.get(o..o + 32) {
+            let name: String = name
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as char)
+                .collect();
+            if !name.is_empty() {
+                s.compression.push(name);
+            }
+            o += 32;
+        }
+    }
+    Some(s)
+}
+
 /// Cheap content check: PAK footer magic within the last 512 bytes.
 pub fn looks_like_pak(path: &Path) -> bool {
-    let Ok(mut f) = File::open(path) else {
-        return false;
-    };
-    let Ok(len) = f.seek(SeekFrom::End(0)) else {
-        return false;
-    };
-    let tail = len.min(512);
-    if tail < 44 || f.seek(SeekFrom::Start(len - tail)).is_err() {
-        return false;
-    }
-    let mut buf = vec![0; tail as usize];
-    if f.read_exact(&mut buf).is_err() {
-        return false;
-    }
-    let magic = PAK_MAGIC.to_le_bytes();
-    buf.windows(4).any(|w| w == magic)
+    sniff_footer(path).is_some()
 }
 
 #[cfg(test)]

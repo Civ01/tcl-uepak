@@ -234,3 +234,77 @@ fn null_and_bad_handles_do_not_crash() {
         assert!(OpenArchiveW(std::ptr::null_mut()).is_null());
     }
 }
+
+/// Patches a freshly written v12 pak: `f(bytes, magic_pos)`.
+fn patched_pak(name: &str, f: impl FnOnce(&mut Vec<u8>, usize)) -> PathBuf {
+    let dir = tmp(name);
+    let pak = dir.join("p.pak");
+    make_pak_v(&pak, repak::Version::V12, &payload());
+    let mut bytes = std::fs::read(&pak).unwrap();
+    let magic = archive::PAK_MAGIC.to_le_bytes();
+    let pos = bytes.windows(4).rposition(|w| w == magic).unwrap();
+    f(&mut bytes, pos);
+    std::fs::write(&pak, bytes).unwrap();
+    pak
+}
+
+fn make_pak_v(path: &Path, version: repak::Version, files: &[(&str, Vec<u8>)]) {
+    let f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let mut w = repak::PakBuilder::new().writer(f, version, "../../../G/".into(), None);
+    for (name, data) in files {
+        w.write_file(name, false, data).unwrap();
+    }
+    w.write_index().unwrap();
+}
+
+#[test]
+fn v12_pak_lists_and_extracts() {
+    let dir = tmp("v12");
+    let pak = dir.join("v12.pak");
+    make_pak_v(&pak, repak::Version::V12, &payload());
+    let sniff = archive::sniff_footer(&pak).unwrap();
+    assert_eq!(sniff.version, 12);
+    assert_eq!(list(&pak).unwrap().len(), payload().len());
+    assert_eq!(extract_all(&pak, &dir.join("out")).len(), payload().len());
+}
+
+#[test]
+fn encrypted_index_is_reported_as_not_supported() {
+    // Flip the "encrypted index" byte that precedes the magic.
+    let pak = patched_pak("enc", |b, pos| b[pos - 1] = 1);
+    let sniff = archive::sniff_footer(&pak).unwrap();
+    assert_eq!(sniff.encrypted_index, Some(true));
+    assert_eq!(list(&pak).err(), Some(E_NOT_SUPPORTED));
+}
+
+#[test]
+fn future_version_is_reported_as_unknown_format() {
+    let pak = patched_pak("v99", |b, pos| {
+        b[pos + 4..pos + 8].copy_from_slice(&99u32.to_le_bytes())
+    });
+    assert_eq!(archive::sniff_footer(&pak).unwrap().version, 99);
+    assert_eq!(list(&pak).err(), Some(E_UNKNOWN_FORMAT));
+}
+
+#[test]
+fn debug_log_writes_to_plugin_dir() {
+    crate::log::configure(true);
+    crate::dlog!("hello from test {}", 42);
+    let path = crate::config::plugin_dir()
+        .unwrap()
+        .join(crate::log::LOG_NAME);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("hello from test 42"));
+    assert!(crate::log::on_error().unwrap().contains("uepak.log"));
+}
+
+/// Manual diagnostic: `UEPAK_DEBUG_PAK=<file> cargo test debug_open_env_pak -- --nocapture`
+/// opens one pak with debug logging on and prints the result code.
+#[test]
+fn debug_open_env_pak() {
+    let Ok(p) = std::env::var("UEPAK_DEBUG_PAK") else { return };
+    crate::log::FORCE.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::log::configure(true);
+    crate::log_environment(&crate::config::Options::default());
+    println!("list result: {:?}", list(Path::new(&p)).map(|l| l.len()));
+}

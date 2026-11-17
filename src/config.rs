@@ -23,6 +23,8 @@ pub enum MountPointMode {
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     pub mount_point: MountPointMode,
+    /// `DebugLog=1`: write a diagnostic log (see `log.rs`).
+    pub debug_log: bool,
 }
 
 static PLUGIN_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -101,15 +103,21 @@ pub fn parse_options(text: &str) -> Options {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        let (key, value) = (
-            key.trim().to_ascii_lowercase(),
-            value.trim().to_ascii_lowercase(),
-        );
-        if section == "options" && key == "mountpoint" {
-            opts.mount_point = match value.as_str() {
-                "folder" | "1" => MountPointMode::Folder,
-                _ => MountPointMode::Root,
-            };
+        if section != "options" {
+            continue;
+        }
+        // Keys are case-insensitive and ignore '_' (DebugLog == debug_log).
+        let key = key.trim().to_ascii_lowercase().replace('_', "");
+        let value = value.trim().to_ascii_lowercase();
+        match key.as_str() {
+            "mountpoint" => {
+                opts.mount_point = match value.as_str() {
+                    "folder" | "1" => MountPointMode::Folder,
+                    _ => MountPointMode::Root,
+                }
+            }
+            "debuglog" => opts.debug_log = matches!(value.as_str(), "1" | "true" | "yes" | "on"),
+            _ => {}
         }
     }
     opts
@@ -126,5 +134,13 @@ mod tests {
         let o = parse_options("; c\n[other]\nMountPoint=Folder\n[options]\nmountpoint=root");
         assert_eq!(o.mount_point, MountPointMode::Root);
         assert_eq!(parse_options("").mount_point, MountPointMode::Root);
+    }
+
+    #[test]
+    fn parses_debug_log() {
+        assert!(parse_options("[Options]\ndebug_log=1").debug_log);
+        assert!(parse_options("[options]\nDebugLog = true").debug_log);
+        assert!(!parse_options("[Options]\nDebugLog=0").debug_log);
+        assert!(!parse_options("").debug_log);
     }
 }
