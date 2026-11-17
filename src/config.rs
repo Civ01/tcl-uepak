@@ -69,6 +69,76 @@ pub struct PackOptions {
     pub compression: PackCompression,
     /// Uncompressed bytes per compression block.
     pub block_size: u32,
+    /// Level for the chosen method; `None` = the method's default.
+    pub level: Option<i32>,
+    pub oodle_compressor: repak::OodleCompressor,
+}
+
+/// Oodle level names (Oodle's numeric values).
+pub const OODLE_LEVELS: [(&str, i32); 14] = [
+    ("HyperFast4", -4),
+    ("HyperFast3", -3),
+    ("HyperFast2", -2),
+    ("HyperFast1", -1),
+    ("None", 0),
+    ("SuperFast", 1),
+    ("VeryFast", 2),
+    ("Fast", 3),
+    ("Normal", 4),
+    ("Optimal1", 5),
+    ("Optimal2", 6),
+    ("Optimal3", 7),
+    ("Optimal4", 8),
+    ("Optimal5", 9),
+];
+
+pub const OODLE_COMPRESSORS: [(&str, repak::OodleCompressor); 5] = [
+    ("Kraken", repak::OodleCompressor::Kraken),
+    ("Mermaid", repak::OodleCompressor::Mermaid),
+    ("Selkie", repak::OodleCompressor::Selkie),
+    ("Leviathan", repak::OodleCompressor::Leviathan),
+    ("Hydra", repak::OodleCompressor::Hydra),
+];
+
+/// Valid level range and default for a method (`None` = no levels).
+pub fn level_range(c: PackCompression) -> Option<(i32, i32, i32)> {
+    match c {
+        PackCompression::Zlib | PackCompression::Gzip => Some((0, 9, 1)),
+        PackCompression::Zstd => Some((1, 22, 3)),
+        PackCompression::Oodle => Some((-4, 9, 4)),
+        PackCompression::None | PackCompression::Lz4 => None,
+    }
+}
+
+/// `6`, `-2`, or an Oodle level name (`Normal`, `Optimal3`, …).
+pub fn parse_level(v: &str) -> Option<i32> {
+    let v = v.trim();
+    v.parse().ok().or_else(|| {
+        OODLE_LEVELS
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(v))
+            .map(|(_, l)| *l)
+    })
+}
+
+impl PackOptions {
+    /// Codec settings for repak; the level applies to the chosen method.
+    pub fn compression_options(&self) -> repak::CompressionOptions {
+        let mut o = repak::CompressionOptions {
+            oodle_compressor: self.oodle_compressor,
+            ..Default::default()
+        };
+        if let Some(l) = self.level {
+            match self.compression {
+                PackCompression::Zlib => o.zlib_level = l.max(0) as u32,
+                PackCompression::Gzip => o.gzip_level = l.max(0) as u32,
+                PackCompression::Zstd => o.zstd_level = l,
+                PackCompression::Oodle => o.oodle_level = l,
+                PackCompression::None | PackCompression::Lz4 => {}
+            }
+        }
+        o
+    }
 }
 
 pub const DEFAULT_PACK_MOUNT: &str = "../../../";
@@ -81,6 +151,8 @@ impl Default for PackOptions {
             version: repak::Version::V11,
             compression: PackCompression::None,
             block_size: DEFAULT_BLOCK_SIZE,
+            level: None,
+            oodle_compressor: repak::OodleCompressor::Mermaid,
         }
     }
 }
@@ -271,6 +343,20 @@ pub fn parse_options(text: &str) -> Options {
                     Some(b) => opts.pack.block_size = b,
                     None => bad(),
                 },
+                "level" if raw.is_empty() || raw.eq_ignore_ascii_case("default") => {
+                    opts.pack.level = None
+                }
+                "level" => match parse_level(raw) {
+                    Some(l) => opts.pack.level = Some(l),
+                    None => bad(),
+                },
+                "oodlecompressor" => match OODLE_COMPRESSORS
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(raw))
+                {
+                    Some((_, c)) => opts.pack.oodle_compressor = *c,
+                    None => bad(),
+                },
                 _ => {}
             }
             continue;
@@ -344,6 +430,17 @@ mod tests {
             "../../../"
         );
         assert_eq!(parse_version("8a"), Some(repak::Version::V8A));
+        let o = parse_options("[Pack]\nCompression=Oodle\nLevel=Optimal3\nOodleCompressor=kraken");
+        assert_eq!(o.pack.level, Some(7));
+        let c = o.pack.compression_options();
+        assert_eq!(
+            (c.oodle_level, c.oodle_compressor),
+            (7, repak::OodleCompressor::Kraken)
+        );
+        let o = parse_options("[Pack]\nCompression=Zlib\nLevel=9");
+        assert_eq!(o.pack.compression_options().zlib_level, 9);
+        assert_eq!(parse_options("[Pack]\nLevel=").pack.level, None);
+        assert_eq!(parse_options("[Pack]\nLevel=fast!").warnings.len(), 1);
         assert_eq!(parse_size("1M"), Some(1 << 20));
     }
 

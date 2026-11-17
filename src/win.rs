@@ -113,6 +113,22 @@ mod imp {
         }
     }
 
+    /// Yes/No question box; true = Yes.
+    pub fn ask_yes_no(text: &str) -> bool {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONQUESTION, MB_YESNO};
+        let text = wide(text);
+        let caption = wide(CAPTION);
+        unsafe {
+            MessageBoxW(
+                GetActiveWindow(),
+                text.as_ptr(),
+                caption.as_ptr(),
+                MB_YESNO | MB_ICONQUESTION | MB_TASKMODAL | MB_SETFOREGROUND,
+            ) == IDYES
+        }
+    }
+
     /// Handle of this DLL (not of TOTALCMD64.EXE); null on failure.
     pub fn module_handle() -> HMODULE {
         let mut module: HMODULE = std::ptr::null_mut();
@@ -274,6 +290,11 @@ mod imp {
 
     pub fn module_path() -> Option<PathBuf> {
         std::env::current_exe().ok()
+    }
+
+    pub fn ask_yes_no(text: &str) -> bool {
+        eprintln!("[{CAPTION}] question (answered No): {text}");
+        false
     }
 
     pub fn dos_time(_t: SystemTime) -> i32 {

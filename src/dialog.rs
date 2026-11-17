@@ -20,6 +20,25 @@ pub struct KeyPrompt<'a> {
 pub static TEST_ANSWERS: std::sync::Mutex<Vec<Option<(String, bool)>>> =
     std::sync::Mutex::new(Vec::new());
 
+#[cfg(test)]
+pub static TEST_CONFIRMS: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+
+/// Yes/No question. Tests answer from `TEST_CONFIRMS` (empty = No).
+pub fn confirm(text: &str) -> bool {
+    #[cfg(test)]
+    {
+        let _ = text;
+        let mut q = TEST_CONFIRMS.lock().unwrap();
+        if q.is_empty() {
+            false
+        } else {
+            q.remove(0)
+        }
+    }
+    #[cfg(not(test))]
+    crate::win::ask_yes_no(text)
+}
+
 /// Shows the dialog. `None` = cancelled.
 pub fn prompt_key(p: &KeyPrompt) -> Option<KeyAnswer> {
     #[cfg(test)]

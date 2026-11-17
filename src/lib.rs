@@ -13,9 +13,11 @@ pub mod dialog;
 pub mod ffi;
 pub mod keys;
 pub mod log;
+mod modify;
 mod pack;
 mod progress;
 mod read;
+pub mod view;
 pub mod win;
 
 #[cfg(test)]
@@ -334,15 +336,6 @@ fn pack_files(
     flags: c_int,
     opts: &config::PackOptions,
 ) -> c_int {
-    if packed.exists() {
-        dlog!("  -> existing pak: adding files is not implemented yet");
-        show_warning(&format!(
-            "{}\n\nAdding files to an existing pak is not implemented yet.\n\
-             Only new paks can be created with this build.",
-            packed.display()
-        ));
-        return E_NOT_SUPPORTED;
-    }
     let plan = match pack::plan(src, sub, items, flags) {
         Ok(p) => p,
         Err(e) => {
@@ -359,6 +352,37 @@ fn pack_files(
             return E_EABORTED;
         }
     };
+    if packed.exists() {
+        let mode = read::view_mode_for(packed, options_view_mode());
+        dlog!(
+            "  existing pak: view={mode:?} compression={:?} level={:?} files={}",
+            opts.compression,
+            opts.level,
+            plan.files.len()
+        );
+        let started = std::time::Instant::now();
+        return match pack::add_to_existing(packed, &plan, mode, opts) {
+            Ok(st) => {
+                dlog!(
+                    "  -> OK in {} ms: {} added ({} replaced), {} bytes in, pak now {} bytes{}",
+                    started.elapsed().as_millis(),
+                    st.added,
+                    st.replaced,
+                    st.input_bytes,
+                    st.pak_bytes,
+                    st.new_mount
+                        .as_ref()
+                        .map(|m| format!(", mount point now {m:?}"))
+                        .unwrap_or_default()
+                );
+                if flags & pack::PK_PACK_MOVE_FILES != 0 {
+                    pack::delete_sources(&plan);
+                }
+                0
+            }
+            Err(e) => report_pack_error(packed, e, "The pak was left unchanged."),
+        };
+    }
     dlog!(
         "  new pak: version={} mount={:?} compression={:?} block_size={} files={}",
         opts.version,
@@ -383,25 +407,33 @@ fn pack_files(
             }
             0
         }
-        Err(e) => {
-            let code = e.code();
-            dlog!("  -> {} ({e})", code_name(code));
-            match e {
-                pack::PackError::Aborted => code,
-                pack::PackError::User(msg, _) => {
-                    show_warning(&msg);
-                    code
-                }
-                other => {
-                    // Our message is more precise than TC's generic one:
-                    // show it and keep TC quiet.
-                    show_error(&format!(
-                        "{}\n\nPacking failed: {other}\nNo pak was created.",
-                        packed.display()
-                    ));
-                    E_EABORTED
-                }
-            }
+        Err(e) => report_pack_error(packed, e, "No pak was created."),
+    }
+}
+
+/// Current `[Options] MountPoint` (view mode used for paks not listed yet).
+fn options_view_mode() -> config::MountPointMode {
+    config::load_options().mount_point
+}
+
+/// Logs and shows a packing error; returns the TC code.
+fn report_pack_error(packed: &Path, e: pack::PackError, outcome: &str) -> c_int {
+    let code = e.code();
+    dlog!("  -> {} ({e})", code_name(code));
+    match e {
+        pack::PackError::Aborted => code,
+        pack::PackError::User(msg, _) => {
+            show_warning(&msg);
+            code
+        }
+        other => {
+            // Our message is more precise than TC's generic one:
+            // show it and keep TC quiet.
+            show_error(&format!(
+                "{}\n\nThe operation failed: {other}\n{outcome}",
+                packed.display()
+            ));
+            E_EABORTED
         }
     }
 }
@@ -413,15 +445,31 @@ pub unsafe extern "system" fn DeleteFilesW(
 ) -> c_int {
     guard(E_NOT_SUPPORTED, "DeleteFilesW", || {
         init();
+        let options = reload_options();
         let items = win::from_wide_multi(delete_list);
-        let details = format!(
-            "PackedFile: {:?}\nDeleteList ({} items):\n{}",
-            win::from_wide_ptr(packed_file),
-            items.len(),
+        let Some(packed) = win::from_wide_ptr(packed_file) else {
+            return E_EOPEN;
+        };
+        let packed = PathBuf::from(packed);
+        let mode = read::view_mode_for(&packed, options.mount_point);
+        dlog!(
+            "DeleteFiles {} view={mode:?}\n{}",
+            packed.display(),
             describe_list(&items)
         );
-        report_unimplemented("DeleteFiles", &details);
-        E_NOT_SUPPORTED
+        let started = std::time::Instant::now();
+        match pack::delete_entries(&packed, &items, mode) {
+            Ok(st) => {
+                dlog!(
+                    "  -> OK in {} ms: {} entries removed, pak now {} bytes",
+                    started.elapsed().as_millis(),
+                    st.removed,
+                    st.pak_bytes
+                );
+                0
+            }
+            Err(e) => report_pack_error(&packed, e, "The pak was left unchanged."),
+        }
     })
 }
 

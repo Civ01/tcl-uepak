@@ -183,6 +183,65 @@ pub(crate) fn ensure_entry_key(arc: &mut Archive) -> Result<(), c_int> {
     })
 }
 
+/// View mode each pak was last listed with (lowercased path -> mode), so
+/// PackFiles/DeleteFiles map TC's view paths the same way (SPEC §3.2).
+pub(crate) static VIEW_MODES: Mutex<Vec<(String, config::MountPointMode)>> = Mutex::new(Vec::new());
+
+fn view_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+pub(crate) fn remember_view_mode(path: &Path, mode: config::MountPointMode) {
+    let key = view_key(path);
+    let mut v = VIEW_MODES.lock().unwrap_or_else(|e| e.into_inner());
+    v.retain(|(k, _)| *k != key);
+    v.push((key, mode));
+    if v.len() > 256 {
+        v.remove(0);
+    }
+}
+
+/// The mode `path` was listed with, else `fallback` (current options).
+pub(crate) fn view_mode_for(
+    path: &Path,
+    fallback: config::MountPointMode,
+) -> config::MountPointMode {
+    let key = view_key(path);
+    VIEW_MODES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .find(|(k, _)| *k == key)
+        .map(|(_, m)| *m)
+        .unwrap_or(fallback)
+}
+
+/// An interrupted modification left `<pak>.uepak-undo`: offer to restore.
+fn offer_undo_restore(path: &Path) {
+    if !crate::modify::has_undo(path) {
+        return;
+    }
+    let text = format!(
+        "{}\n\nAn earlier change to this pak was interrupted (Total Commander or Windows \
+         stopped while writing).\n\nYes: restore the pak to its state before that change.\n\
+         No: keep the pak as it is now and delete the backup.",
+        path.display()
+    );
+    if crate::dialog::confirm(&text) {
+        match crate::modify::restore(path) {
+            Ok(()) => dlog!("  undo: pak restored from backup"),
+            Err(e) => {
+                dlog!("  undo: restore failed: {e}");
+                show_error(&format!("Restoring {} failed: {e}", path.display()));
+            }
+        }
+    } else {
+        let _ = crate::modify::discard_undo(path);
+        dlog!("  undo: backup discarded, current state kept");
+    }
+}
+
 pub(crate) fn open_impl(name: Option<String>, mode: c_int, result: &mut c_int) -> Handle {
     init();
     let Some(name) = name else {
@@ -206,9 +265,11 @@ pub(crate) fn open_impl(name: Option<String>, mode: c_int, result: &mut c_int) -
             None => dlog!("  footer: no PAK magic in the last 512 bytes"),
         }
     }
+    offer_undo_restore(&path);
     let started = std::time::Instant::now();
     match open_with_keys(&path, &options) {
         Ok(arc) => {
+            remember_view_mode(&path, options.mount_point);
             dlog!(
                 "  opened in {} ms: version={:?} mount={:?} entries={} skipped_unsafe={} compression={:?} encrypted_index={}",
                 started.elapsed().as_millis(),

@@ -188,16 +188,11 @@ fn rejects_non_pak() {
 }
 
 #[test]
-fn delete_stub_records_and_refuses() {
-    let pak = wide("C:\\x\\new.pak");
+fn parses_tc_multi_string_lists() {
     let list: Vec<u16> = "a.txt\0dir\\b.txt\0\0".encode_utf16().collect();
     assert_eq!(
         unsafe { win::from_wide_multi(list.as_ptr()) },
         vec!["a.txt", "dir\\b.txt"]
-    );
-    assert_eq!(
-        unsafe { DeleteFilesW(pak.as_ptr(), list.as_ptr()) },
-        E_NOT_SUPPORTED
     );
     assert!(unsafe { win::from_wide_multi(std::ptr::null()) }.is_empty());
 }
@@ -663,8 +658,7 @@ fn pack_through_tc_export_with_defaults() {
     assert_eq!(r, 0);
     let names: Vec<_> = read_back(&pak).into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, ["a.txt", "deps/big.bin"]);
-    // existing pak: not implemented yet, refused, untouched
-    let before = std::fs::read(&pak).unwrap();
+    // the same files again onto the now existing pak: replaced in place
     let r = unsafe {
         PackFilesW(
             pak_w.as_ptr(),
@@ -674,8 +668,9 @@ fn pack_through_tc_export_with_defaults() {
             2,
         )
     };
-    assert_eq!(r, E_NOT_SUPPORTED);
-    assert_eq!(std::fs::read(&pak).unwrap(), before);
+    assert_eq!(r, 0);
+    let names: Vec<_> = read_back(&pak).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["a.txt", "deps/big.bin"]);
 }
 
 #[test]
@@ -806,4 +801,302 @@ fn parity_with_reference_pak() {
         a == b
     );
     assert_eq!(a, b, "byte-identical");
+}
+
+// ---------------------------------------------------------------------------
+// Modifying existing paks (M1)
+
+/// Serialises tests that queue confirm answers.
+static CONFIRM_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn confirm_next(answers: &[bool]) {
+    let mut q = crate::dialog::TEST_CONFIRMS.lock().unwrap();
+    q.clear();
+    q.extend_from_slice(answers);
+}
+
+/// Pak with mount ../../../TheIsle/Content/ and two entries.
+fn base_pak(name: &str) -> (PathBuf, PathBuf) {
+    let dir = tmp(name);
+    let pak = dir.join("base.pak");
+    let f = std::io::BufWriter::new(std::fs::File::create(&pak).unwrap());
+    let mut w = repak::PakBuilder::new()
+        .compression([repak::Compression::Zlib])
+        .writer(
+            f,
+            repak::Version::V11,
+            "../../../TheIsle/Content/".into(),
+            None,
+        );
+    w.write_file("Maps/A.umap", true, b"map a".repeat(500))
+        .unwrap();
+    w.write_file("Config/x.ini", false, b"[x]\nk=v\n").unwrap();
+    w.write_index().unwrap();
+    let src = dir.join("src");
+    std::fs::create_dir_all(src.join("Maps")).unwrap();
+    std::fs::write(src.join("new.txt"), b"brand new").unwrap();
+    std::fs::write(src.join("Maps").join("A.umap"), b"replaced map").unwrap();
+    (pak, src)
+}
+
+fn pack_ffi(pak: &Path, sub: Option<&str>, src: &Path, list: &str, flags: i32) -> i32 {
+    let pak_w = wide(&pak.to_string_lossy());
+    let src_w = wide(&format!("{}{}", src.display(), std::path::MAIN_SEPARATOR));
+    let sub_w = sub.map(wide);
+    // TC lists: NUL after each item plus a final NUL
+    let list_w: Vec<u16> = format!("{list}\0\0").encode_utf16().collect();
+    unsafe {
+        PackFilesW(
+            pak_w.as_ptr(),
+            sub_w.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            src_w.as_ptr(),
+            list_w.as_ptr(),
+            flags,
+        )
+    }
+}
+
+fn delete_ffi(pak: &Path, list: &str) -> i32 {
+    let pak_w = wide(&pak.to_string_lossy());
+    // TC lists: NUL after each item plus a final NUL
+    let list_w: Vec<u16> = format!("{list}\0\0").encode_utf16().collect();
+    unsafe { DeleteFilesW(pak_w.as_ptr(), list_w.as_ptr()) }
+}
+
+/// Game path of every entry: mount (minus base) + entry, lowercased.
+fn game_paths(pak: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut f = std::io::BufReader::new(std::fs::File::open(pak).unwrap());
+    let r = repak::PakBuilder::new().reader(&mut f).unwrap();
+    let mount = crate::view::Mount::parse(r.mount_point()).visible.join("/");
+    let mut v: Vec<_> = r
+        .files()
+        .into_iter()
+        .map(|p| {
+            let d = r.get(&p, &mut f).unwrap();
+            let full = if mount.is_empty() {
+                p
+            } else {
+                format!("{mount}/{p}")
+            };
+            (full.to_lowercase(), d)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn f5_into_open_pak_adds_and_replaces_inside_mount() {
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, src) = base_pak("mod-add");
+    list(&pak).unwrap(); // TC lists first: remembers Folder view
+                         // F5 into TheIsle\Content: new.txt + Maps\A.umap (replace)
+    let r = pack_ffi(
+        &pak,
+        Some("TheIsle\\Content"),
+        &src,
+        "new.txt\0Maps\\\0Maps\\A.umap",
+        2,
+    );
+    assert_eq!(r, 0);
+    assert!(!crate::modify::has_undo(&pak));
+    let back = read_back(&pak);
+    let names: Vec<_> = back.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["Config/x.ini", "Maps/A.umap", "new.txt"]);
+    assert_eq!(back[1].1, b"replaced map");
+    let mut f = std::io::BufReader::new(std::fs::File::open(&pak).unwrap());
+    let r = repak::PakBuilder::new().reader(&mut f).unwrap();
+    assert_eq!(
+        r.mount_point(),
+        "../../../TheIsle/Content/",
+        "mount unchanged"
+    );
+    // and the plugin itself still reads it
+    assert_eq!(list(&pak).unwrap().len(), 3);
+    if let Ok(dir) = std::env::var("UEPAK_KEEP_PACKED") {
+        std::fs::copy(&pak, Path::new(&dir).join("modified_add.pak")).unwrap();
+    }
+}
+
+#[test]
+fn outside_mount_asks_then_reroots_keeping_game_paths() {
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, src) = base_pak("mod-reroot");
+    list(&pak).unwrap();
+    let before_bytes = std::fs::read(&pak).unwrap();
+    let before = game_paths(&pak);
+    // "No" -> nothing written
+    confirm_next(&[false]);
+    assert_eq!(
+        pack_ffi(&pak, Some("TheIsle"), &src, "new.txt", 2),
+        E_EABORTED
+    );
+    assert_eq!(
+        std::fs::read(&pak).unwrap(),
+        before_bytes,
+        "untouched after No"
+    );
+    // "Yes" -> mount widened to TheIsle, entries re-rooted
+    confirm_next(&[true]);
+    assert_eq!(pack_ffi(&pak, Some("TheIsle"), &src, "new.txt", 2), 0);
+    let mut f = std::io::BufReader::new(std::fs::File::open(&pak).unwrap());
+    let r = repak::PakBuilder::new().reader(&mut f).unwrap();
+    assert_eq!(r.mount_point(), "../../../TheIsle/");
+    let after = game_paths(&pak);
+    for old in &before {
+        assert!(after.contains(old), "existing game path kept: {}", old.0);
+    }
+    assert!(after
+        .iter()
+        .any(|(p, d)| p == "theisle/new.txt" && d == b"brand new"));
+    // packing at the panel root widens to the bare base
+    confirm_next(&[true]);
+    std::fs::write(src.join("root.txt"), b"r").unwrap();
+    assert_eq!(pack_ffi(&pak, None, &src, "root.txt", 2), 0);
+    let mut f = std::io::BufReader::new(std::fs::File::open(&pak).unwrap());
+    let r = repak::PakBuilder::new().reader(&mut f).unwrap();
+    assert_eq!(r.mount_point(), "../../../");
+    assert!(game_paths(&pak)
+        .iter()
+        .any(|(p, _)| p == "theisle/content/maps/a.umap"));
+    if let Ok(dir) = std::env::var("UEPAK_KEEP_PACKED") {
+        std::fs::copy(&pak, Path::new(&dir).join("modified_reroot.pak")).unwrap();
+    }
+}
+
+#[test]
+fn f8_deletes_files_folders_and_mount_folders() {
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, _src) = base_pak("mod-del");
+    list(&pak).unwrap();
+    // nothing matched -> unchanged
+    let before = std::fs::read(&pak).unwrap();
+    assert_eq!(delete_ffi(&pak, "Elsewhere\\x.ini"), 0);
+    assert_eq!(std::fs::read(&pak).unwrap(), before);
+    // a file (Folder view path)
+    assert_eq!(delete_ffi(&pak, "TheIsle\\Content\\Config\\x.ini"), 0);
+    let names: Vec<_> = read_back(&pak).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["Maps/A.umap"]);
+    assert!(
+        std::fs::read(&pak).unwrap().len() < before.len(),
+        "truncated"
+    );
+    // a mount folder -> everything; result is a valid empty pak
+    assert_eq!(delete_ffi(&pak, "TheIsle\\*.*"), 0);
+    assert!(read_back(&pak).is_empty());
+    assert!(list(&pak).unwrap().is_empty());
+}
+
+#[test]
+fn delete_uses_the_view_mode_the_pak_was_listed_with() {
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, _src) = base_pak("mod-viewmem");
+    crate::read::remember_view_mode(&pak, crate::config::MountPointMode::Root);
+    // Root view path (as TC would send after a Root listing)
+    assert_eq!(delete_ffi(&pak, "Config\\*.*"), 0);
+    let names: Vec<_> = read_back(&pak).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["Maps/A.umap"]);
+}
+
+unsafe extern "system" fn cancel_after_first(_n: *mut u16, _s: i32) -> i32 {
+    0
+}
+
+#[test]
+fn cancel_or_failure_leaves_pak_byte_identical() {
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, src) = base_pak("mod-cancel");
+    list(&pak).unwrap();
+    let before = std::fs::read(&pak).unwrap();
+    SetProcessDataProcW(std::ptr::null_mut(), Some(cancel_after_first));
+    let r = pack_ffi(&pak, Some("TheIsle\\Content"), &src, "new.txt", 2);
+    SetProcessDataProcW(std::ptr::null_mut(), None);
+    assert_eq!(r, E_EABORTED);
+    assert_eq!(std::fs::read(&pak).unwrap(), before, "rolled back");
+    assert!(!crate::modify::has_undo(&pak));
+    // unreadable source mid-way
+    let r = pack_ffi(
+        &pak,
+        Some("TheIsle\\Content"),
+        &src,
+        "new.txt\0missing.bin",
+        2,
+    );
+    assert_eq!(r, E_EABORTED);
+    assert_eq!(
+        std::fs::read(&pak).unwrap(),
+        before,
+        "rolled back after read error"
+    );
+}
+
+#[test]
+fn interrupted_change_is_restored_on_open() {
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, _src) = base_pak("mod-crash");
+    let original = std::fs::read(&pak).unwrap();
+    // simulate a crash after the undo file was written and the tail overwritten
+    let mut f = std::io::BufReader::new(std::fs::File::open(&pak).unwrap());
+    let off = repak::PakBuilder::new()
+        .reader(&mut f)
+        .unwrap()
+        .index_offset()
+        .unwrap();
+    drop(f);
+    let mut undo = b"UEPAKUNDO1".to_vec();
+    undo.extend((original.len() as u64).to_le_bytes());
+    undo.extend(off.to_le_bytes());
+    undo.extend(&original[off as usize..]);
+    std::fs::write(crate::modify::undo_path(&pak), undo).unwrap();
+    let mut broken = original[..off as usize].to_vec();
+    broken.extend(b"half-written garbage");
+    std::fs::write(&pak, &broken).unwrap();
+    // editing is refused while the undo file exists
+    assert_eq!(delete_ffi(&pak, "TheIsle\\*.*"), E_NOT_SUPPORTED);
+    // opening offers the restore: Yes
+    confirm_next(&[true]);
+    assert_eq!(list(&pak).unwrap().len(), 2);
+    assert_eq!(
+        std::fs::read(&pak).unwrap(),
+        original,
+        "restored byte-identical"
+    );
+    assert!(!crate::modify::has_undo(&pak));
+}
+
+#[test]
+fn modify_refusals() {
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    // encrypted pak (repak test pak): refused, untouched
+    let enc = copy_to_tmp("mod-enc", &testdata("enc_entries.pak"));
+    let before = std::fs::read(&enc).unwrap();
+    assert_eq!(
+        delete_ffi(&enc, "mount\\point\\root\\test.txt"),
+        E_NOT_SUPPORTED
+    );
+    assert_eq!(std::fs::read(&enc).unwrap(), before);
+    // adding a new compression method fills a free footer slot
+    let (pak, src) = base_pak("mod-slot");
+    list(&pak).unwrap();
+    let opts = crate::config::PackOptions {
+        compression: crate::config::PackCompression::Gzip,
+        ..crate::config::PackOptions::default()
+    };
+    // compressible, so Gzip is actually used (incompressible data is stored raw)
+    std::fs::write(src.join("big.txt"), b"gzip me ".repeat(5000)).unwrap();
+    let r = crate::pack_files(
+        &pak,
+        Some("TheIsle\\Content"),
+        &src,
+        &["big.txt".to_string()],
+        2,
+        &opts,
+    );
+    assert_eq!(r, 0);
+    let slots = archive::sniff_footer(&pak).unwrap().compression;
+    assert!(
+        slots.contains(&"Zlib".to_string()) && slots.contains(&"Gzip".to_string()),
+        "{slots:?}"
+    );
+    assert_eq!(read_back(&pak).len(), 3);
 }

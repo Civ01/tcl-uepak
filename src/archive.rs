@@ -69,11 +69,8 @@ pub struct Archive {
 
 /// Turns `../../../Game/Content/` into `Game\Content` (empty if nothing left).
 pub fn mount_prefix(mount_point: &str) -> String {
-    mount_point
-        .split(['/', '\\'])
-        .filter(|s| !s.is_empty() && *s != ".." && *s != ".")
-        .collect::<Vec<_>>()
-        .join("\\")
+    // Same split as the pack/delete mapping uses, so listing and editing agree.
+    crate::view::Mount::parse(mount_point).display_prefix()
 }
 
 /// Rejects entry names that would escape the destination folder.
