@@ -5,9 +5,13 @@ Built in Rust on a fork of [repak](https://github.com/Civ01/repak).
 
 Status:
 - **Reading:** list, extract (F5), test, AES-encrypted paks (key prompt, remembered keys).
-- **Packing:** new paks via Alt+F5 with no compression, Zlib, Gzip, Oodle, Zstd or LZ4
-  (settings in `uepak.ini` `[Pack]`). Adding to / deleting from existing paks and the
-  settings dialog are next (see SPEC.md).
+- **Packing:** new paks (Alt+F5), adding/replacing in existing paks (F5 into an open pak),
+  deleting (F8). No compression, Zlib, Gzip, Oodle, Zstd or LZ4, with levels. Changes to
+  existing paks are crash-safe (undo file, restore offered on next open).
+- **Settings:** the Configure button in TC's pack dialog (or the plugin settings) opens a
+  dialog that writes `uepak.ini`.
+
+Next: large-file streaming and adding to encrypted paks (see SPEC.md §0).
 
 ## Install
 

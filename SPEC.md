@@ -16,24 +16,24 @@ Document status: **v2** (2026-11-17). Markers: **[done]** implemented and tested
 | Reading | List, extract, test; pak versions 2–12; None/Zlib/Gzip/Zstd/LZ4/Oodle; >4 GB entries |
 | AES (read) | Key prompt, wrong-key detection, remembered keys (folder/parent, same GUID), session cache |
 | Views | `Folder` (default) with marked mount folders, `Root` |
-| Packing | New paks via Alt+F5 with every compression method; settings from `uepak.ini [Pack]` |
+| Packing | New paks (Alt+F5), adding/replacing in existing paks (F5 into a pak), deleting (F8); every compression method with levels and Oodle compressor; crash-safe in-place changes with undo/recovery |
+| Settings | Configure dialog (TC's pack dialog / plugin settings) writing `uepak.ini` |
 | Robustness | Panic guard on every export, allocation guards in the fork, path-traversal checks, no partial output files |
 | Diagnostics | `DebugLog`, clipboard fallback, independent footer parser |
-| Tests | 33 automated tests (Windows CI); Wine-driven key dialog test; index-hash verification script |
+| Tests | 48 automated tests (Windows CI); Wine-driven key and settings dialogs; index-hash verification; byte parity with repak |
 
 ### Roadmap
 
 | # | Milestone | Contents | Fork work |
 |---|---|---|---|
-| **M1** | **Modify existing paks** (next) | F5 into an open pak (add/replace), F8 delete, view-path → entry-path mapping incl. the `Folder`-mode mount guard and per-archive mode memory, transactional append with undo file, crash recovery | F6 |
-| M2 | Settings dialog | `ConfigurePacker` dialog (§5); compression levels and Oodle compressor | F4 (rest) |
-| M3 | Large files | Streaming writes and block-by-block reads (constant memory, per-block progress), entry SHA-1 check in `PK_TEST` | F5, F7, F9 |
+| M1 | ✅ Modify existing paks | F5 into an open pak (add/replace), F8 delete, view-path mapping with the `Folder`-mode mount guard, per-archive mode memory, transactional append with undo file, crash recovery | F6 ✅ |
+| M2 | ✅ Settings dialog | `ConfigurePacker` dialog (§5); compression levels and Oodle compressor | F4 ✅ |
+| **M3** | **Large files** (next) | Streaming writes and block-by-block reads (constant memory, per-block progress), entry SHA-1 check in `PK_TEST` | F5, F7, F9 |
 | M4 | Encrypted modify + compact | Adding to/deleting from encrypted paks (§4.4), "Compact when modifying" rebuild | F10, F6 (copy stored entries) |
 | M5 | Polish | Text search in archives, background operations, v13–15 reading (no samples exist yet) | F8 |
 
-Rationale for the order: M1 completes the core TC workflows (the capabilities are already
-advertised, so F5/F8 currently show "not implemented"). M2 replaces hand-editing the ini.
-M3 matters only for very large files. M4 depends on M1's modify machinery.
+Next: M3 (whole files are still read into memory when packing and decompressed into
+memory when extracting) or M4 (needs M1's machinery, now in place); M5 last.
 
 ---
 
@@ -72,11 +72,14 @@ Plugin modules:
 
 | Module | Contents |
 |---|---|
-| `lib.rs` | Exports, panic guard, init/options reload, popups, `PackFilesW` dispatch |
-| `read.rs` | Open (incl. AES key resolution), list, extract, test |
-| `pack.rs` | Pack planning (AddList → entries), new-pak writer |
+| `lib.rs` | Exports, panic guard, init/options reload, popups, pack/delete dispatch |
+| `read.rs` | Open (incl. AES key resolution, undo recovery), list, extract, test, view-mode memory |
+| `pack.rs` | Pack planning (AddList → entries), new paks, add to / delete from existing paks |
+| `modify.rs` | In-place transaction: undo file, rewrite, truncate, rollback, restore |
+| `view.rs` | Mount point split, view path ↔ entry path mapping |
+| `settings.rs` | Settings model, choice lists, warnings, comment-preserving ini writer |
 | `archive.rs` | Opened-pak model, view paths, footer sniffer |
-| `keys.rs`, `dialog.rs` | AES key parsing/storage/lookup, key prompt |
+| `keys.rs`, `dialog.rs` | AES key parsing/storage/lookup; key prompt, settings dialog, confirmations |
 | `progress.rs` | Per-thread TC progress callback |
 | `config.rs`, `log.rs`, `win.rs`, `ffi.rs` | `uepak.ini`, debug log, Win32 helpers, WCX definitions |
 
@@ -108,9 +111,9 @@ Files ACLs), hence the write probe. **[done]**
 | `CanYouHandleThisFileW` | **[done]** (footer magic in the last 512 bytes) |
 | `PackSetDefaultParams` | **[done]** |
 | `GetPackerCaps` | **[done]** `NEW \| MODIFY \| MULTIPLE \| DELETE \| OPTIONS \| BY_CONTENT` |
-| `PackFilesW` | **[partial]** new paks; existing paks refused (M1) |
-| `DeleteFilesW` | stub: records the arguments (popup, clipboard, log) and refuses (M1) |
-| `ConfigurePacker` | stub: records and refuses (M2) |
+| `PackFilesW` | **[done]** new and existing paks |
+| `DeleteFilesW` | **[done]** |
+| `ConfigurePacker` | **[done]** settings dialog |
 | `GetBackgroundFlags` | not exported (M5, §8.1) |
 | ANSI variants | read functions convert and forward; `PackFiles`/`DeleteFiles` ANSI refuse (TC x64 uses W) |
 
@@ -168,9 +171,10 @@ Extracting a mount folder creates a plain folder. Names are never decorated (`<�
 names travel back into extraction paths and `DeleteList`, and `<` `>` are invalid in file
 names.
 
-**Mode consistency (M1):** the plugin will remember, per archive path, which mode its last
-listing used, and map `PackFiles`/`DeleteFiles` paths with that mode, so changing the mode
-while a pak is open can't make a delete hit the wrong entries.
+**Mode consistency [done]:** the plugin remembers, per archive path, which mode its last
+listing used, and maps `PackFiles`/`DeleteFiles` paths with that mode, so changing the mode
+while a pak is open can't make a delete hit the wrong entries. Listing and editing use the
+same mount-point split (`view.rs`).
 
 ### 3.3 Extracting and testing **[done]**
 
@@ -234,18 +238,18 @@ moved to `uepak.keys.json.bad`. Keys are plain text (TC's master-password store 
 | TC action | Plugin call | Status |
 |---|---|---|
 | Alt+F5 to a new `.pak` | `PackFilesW`, file doesn't exist | **[done]** |
-| Alt+F5 with an existing pak's name typed in | `PackFilesW`, file exists | M1 (refused for now); always at the pak's root |
-| F5 into an open pak | `PackFilesW`, file exists, `SubPath` = current folder | M1 (refused for now) |
-| F8 inside an open pak | `DeleteFilesW` | M1 (stub) |
-| "Configure" in the Alt+F5 dialog | `ConfigurePacker` | M2 (stub) |
+| Alt+F5 with an existing pak's name typed in | `PackFilesW`, file exists | **[done]**, always at the pak's root |
+| F5 into an open pak | `PackFilesW`, file exists, `SubPath` = current folder | **[done]** |
+| F8 inside an open pak | `DeleteFilesW` | **[done]** |
+| "Configure" in the Alt+F5 dialog | `ConfigurePacker` | **[done]** |
 
 Alt+F5 does **not** target a pak open in the other panel: TC proposes
 `<target dir>\<source folder>.pak`. To add to an open pak, use F5 into it.
 
 TC passes no per-operation settings to `PackFiles`; the current settings (`uepak.ini
-[Pack]`, edited by the dialog from M2) apply to every pack.
+[Pack]`, edited by the Configure dialog) apply to every pack.
 
-### 4.2 Path mapping **[done for new paks]**
+### 4.2 Path mapping **[done]**
 
 **The mount point places the files; entry paths are relative to the selected items.**
 
@@ -265,7 +269,7 @@ TC passes no per-operation settings to `PackFiles`; the current settings (`uepak
   ways). This keeps output byte-identical to repak: verified against a repak-made pak
   (`UEPAK_PARITY_PAK` test).
 
-#### 4.2.1 Existing paks: view path → entry path (M1)
+#### 4.2.1 Existing paks: view path → entry path **[done]**
 
 **`Root` mode:** entry path = view path. No guards.
 
@@ -285,9 +289,10 @@ TC passes no per-operation settings to `PackFiles`; the current settings (`uepak
   No → `E_EABORTED`, nothing written. Cheap because entry paths exist only in the index.
 - The hidden base never changes. Comparisons are case-insensitive.
 
-### 4.3 New paks **[partial]**
+### 4.3 New paks **[done]** (streaming: M3)
 
-Settings: `[Pack]` mount point, version, compression, block size (§6).
+Settings: `[Pack]` mount point, version, compression, level, Oodle compressor, block
+size (§6).
 
 - **[done]** Per-entry fallback: an entry that doesn't shrink is stored uncompressed.
 - **[done]** Checked before writing: version/compression compatibility (V2 has no
@@ -301,10 +306,11 @@ Settings: `[Pack]` mount point, version, compression, block size (§6).
   correct (UE checks them on mount), same layout as real UE paks.
 - M3: files are currently read into memory whole; streaming writes (F5) will keep memory
   flat and report progress per block.
-- M2: compression level and Oodle compressor (currently the codec defaults; Oodle uses
-  Mermaid / Normal).
+- **[done]** Byte-identical to repak for the same settings (verified with a repak-made pak;
+  `UEPAK_PARITY_PAK` test). Default levels match repak's (Zlib/Gzip 1, Zstd 3, Oodle
+  Mermaid/Normal).
 
-### 4.4 Modifying existing paks (M1; encryption and compact: M4)
+### 4.4 Modifying existing paks **[done]** (encryption and compact: M4)
 
 New/replaced data is written where the old index was, then a new index and footer.
 
@@ -313,7 +319,10 @@ New/replaced data is written where the old index was, then a new index and foote
 - **Compression:** the `[Pack]` method for new entries; added to a free footer slot (v8+
   has 5) if missing. No free slot, or version < 8 with a method other than
   Zlib/Gzip/Oodle → refused with a message.
-- **Replace:** same path → replaced (TC doesn't confirm for plugins; logged).
+- **Replace:** same path (case-insensitive) → replaced (TC doesn't confirm for plugins;
+  logged).
+- Verified: modified paks pass the UE index-hash checks; data before the old index is
+  never touched.
 - **Refused:** v9 paks with a frozen index; versions repak can't write; (until M4)
   encrypted paks.
 - **Crash safety (transactional append):**
@@ -321,7 +330,11 @@ New/replaced data is written where the old index was, then a new index and foote
   2. Append data, write the new index and footer, flush.
   3. Success → delete the undo file. Failure/cancel → truncate, restore the tail, delete
      the undo file.
-  4. On open, if `<pak>.uepak-undo` exists, offer to restore the previous state.
+  4. On open, if `<pak>.uepak-undo` exists, ask: Yes = restore the previous state,
+     No = keep the current state and delete the backup. Changes to the pak are refused
+     while an undo file is pending.
+  - The file is truncated to the new end after every rewrite (a delete-only change writes
+    a smaller index than before).
 - **Dead space** from replaced/deleted data is not tracked; it grows until a compact rebuild.
 - **M4, encrypted paks:** allowed after a confirmation:
 
@@ -335,24 +348,25 @@ New/replaced data is written where the old index was, then a new index and foote
   new pak (`<pak>.uepak-new`) from the kept entries (stored bytes copied, no
   recompression) plus the new ones, then replace the original. No dead space, no undo file.
 
-### 4.5 Deleting (M1)
+### 4.5 Deleting **[done]**
 
 - `DeleteList` items are view paths exactly as listed (§11): files one per line, a folder
   as `folder\*.*` (everything below it).
 - Mapped as in §4.2.1; deleting never changes the mount point; deleting a mount folder
   deletes everything below it.
 - Index-only rewrite with the §4.4 transaction; deleting everything leaves a valid empty pak.
+- Items matching nothing (e.g. outside the visible mount part) leave the pak unchanged.
 - Same refusals as §4.4.
 
 ### 4.6 Compression methods for writing
 
-| Method | Status | Levels (M2) | Notes |
+| Method | Status | Levels | Notes |
 |---|---|---|---|
 | None | **[done]** | — | |
-| Zlib | **[done]** | 1–9 | Read by every UE4/UE5 version |
-| Gzip | **[done]** | 1–9 | Rarely used by games |
+| Zlib | **[done]** | 0–9, default 1 | Read by every UE4/UE5 version |
+| Gzip | **[done]** | 0–9, default 1 | Rarely used by games |
 | Oodle | **[done]**, to verify in TC | HyperFast4…Optimal5, default Normal; compressor Kraken/Mermaid/Selkie/Leviathan/Hydra, default Mermaid | Needs the `deps\` DLL. UE's default for shipped games |
-| Zstd | **[done]** | 1–22 | Not built into stock UE; only games that enable it can read it |
+| Zstd | **[done]** | 1–22, default 3 | Not built into stock UE; only games that enable it can read it |
 | LZ4 | **[done]** | — | Only games that enable it |
 
 ### 4.7 Block size **[done]**
@@ -360,14 +374,15 @@ New/replaced data is written where the old index was, then a new index and foote
 - `[Pack] BlockSize`, default **64 KB** (UnrealPak default); accepts bytes or `64K`/`1M`,
   1 KB – 64 MB.
 - Up to 126,976 bytes (124 KB) uses the compact encoding every engine reads. Larger
-  values use the extended encoding, which older engines can't read (the dialog will warn).
+  values use the extended encoding, which older engines can't read (the dialog warns).
 
 ---
 
-## 5. Settings dialog (`ConfigurePacker`) (M2)
+## 5. Settings dialog (`ConfigurePacker`) **[done]**
 
 Modal, child of TC's window, built from an in-memory dialog template like the key dialog
-(no resource compiler), `MS Shell Dlg 2`, DPI scaling through dialog units.
+(no resource compiler; the template builder counts its items), `MS Shell Dlg 2`, DPI
+scaling through dialog units. Tested under Wine by driving the real controls.
 
 ```
 ┌ UE PAK plugin settings ───────────────────────────────┐
@@ -378,14 +393,15 @@ Modal, child of TC's window, built from an in-memory dialog template like the ke
 │   Level           [Normal                        ▼]   │
 │   Oodle compressor[Mermaid                       ▼]   │
 │   Block size      [64 KB                         ▼]   │
-│   [ ] Compact when modifying (rewrite whole pak)      │
-│   ⚠ (warning line: Zstd/LZ4, large blocks, Oodle DLL) │
+│   ⚠ (warnings: settings conflicts, Zstd/LZ4, large    │
+│      blocks, Oodle library found / not found)          │
 │                                                       │
 │ Browsing                                              │
 │   Mount point     (•) as folders  ( ) as root         │
 │   Mount folders   [ReadOnly                      ▼]   │
 │   [ ] Debug log (uepak.log)                           │
 │                                                       │
+│ Saved to <path of uepak.ini>                          │
 │ [Defaults]                          [ OK ] [ Cancel ] │
 └───────────────────────────────────────────────────────┘
 ```
@@ -393,11 +409,15 @@ Modal, child of TC's window, built from an in-memory dialog template like the ke
 - PAK versions labelled with their UE range: v12 (5.3+), **v11 (4.26–5.x, default)**,
   v10, v9 (4.25), v8B (4.23–4.24), v8A (4.22), v7 (4.21), v5 (4.20), v4 (4.16–4.19),
   v3 (4.3–4.15), v2 (4.0–4.2).
-- Level / Oodle compressor enabled only for methods that use them.
-- The Oodle line shows which DLL would be loaded, or "not found in deps\".
-- OK saves to `uepak.ini` in the settings directory (`WritePrivateProfileStringW`, so
-  comments survive); if that directory has no `uepak.ini` yet, the shipped one is copied
-  first. Defaults resets the fields without saving.
+- Level choices follow the method (Zlib/Gzip 0–9, Zstd 1–22, Oodle level names, each with
+  "Default"); Level / Oodle compressor are disabled for methods that don't use them.
+- Block sizes: 64 KB, 124 KB, 256 KB, 512 KB, 1 MB, plus the current value if it's custom.
+- Warnings update live; the Oodle line names the DLL that would be used.
+- OK saves to `uepak.ini` in the settings directory with a small writer that keeps
+  comments, order and line endings (instead of `WritePrivateProfileStringW`: same effect,
+  but UTF-8 and testable on any OS). If that directory has no `uepak.ini` yet, the shipped
+  one is copied first. Defaults resets the fields without saving. Compact (M4) is not in
+  the dialog yet.
 
 ---
 
@@ -414,14 +434,15 @@ MountPoint=../../../       ;                                              [done]
 Version=V11                ; V2 … V12 (V1, V6 not writable)               [done]
 Compression=None           ; None | Zlib | Gzip | Oodle | Zstd | LZ4      [done]
 BlockSize=64K              ; bytes, or 64K / 1M                            [done]
-Level=                     ; method-specific, empty = default              (M2)
-OodleCompressor=Mermaid    ; Kraken | Mermaid | Selkie | Leviathan | Hydra (M2)
+Level=                     ; method-specific, empty = default              [done]
+OodleCompressor=Mermaid    ; Kraken | Mermaid | Selkie | Leviathan | Hydra [done]
 Compact=0                  ; 1 = full rebuild when modifying               (M4)
 ```
 
 - Keys are case-insensitive and ignore `_` (`DebugLog` = `debug_log`). **[done]**
 - Invalid values keep the default and are logged. **[done]**
-- Re-read on every `OpenArchive` and `PackFiles` call (no TC restart). **[done]**
+- Inline comments after values (`Key=Value ; comment`) are allowed. **[done]**
+- Re-read on every `OpenArchive`, `PackFiles` and `DeleteFiles` call (no TC restart). **[done]**
 - Read order: settings directory, then the shipped file in the plugin folder. **[done]**
 
 ---
@@ -434,8 +455,9 @@ Compact=0                  ; 1 = full rebuild when modifying               (M4)
   clipboard on every failed operation; popups say where the log is.
 - Logged: environment (paths, `deps\` contents, Oodle search paths, options and option
   warnings); raw footer of each opened pak (independent parser); open result and key
-  lookup steps; per-entry extract details and timing; pack arguments, resolved settings,
-  each packed entry, result and size; panics.
+  lookup steps; per-entry extract details and timing; pack/delete arguments, view mode,
+  resolved settings, each added/replaced/removed entry, mount-point changes, undo save /
+  commit / rollback, result and size; settings dialog saves; panics.
 - Never logged: AES keys.
 
 ---
@@ -448,7 +470,8 @@ Compact=0                  ; 1 = full rebuild when modifying               (M4)
 - **[done]** Untrusted lengths from pak files never drive allocations (fork guards); a wrong
   key is detected before parsing.
 - **[done]** New paks and extracted files are never left half-written.
-- M1: a modified pak is never left half-written (§4.4).
+- **[done]** A modified pak is never left half-written (§4.4); a panic during a change
+  rolls back too.
 - M5: no modal popups during background operations (§8.1).
 
 ### 8.1 Background operations (M5)
@@ -467,9 +490,9 @@ BACKGROUND_PACK`: background-safe popups (key prompt, warnings) and locking arou
 | F1 | Oodle: search paths, any `oo2core_N`, no hash pin, failures not cached, download behind a feature, no unwrap, loaded-path reporting | ✅ |
 | F2 | `entries()` / `entry()` → `EntryInfo` | ✅ |
 | F3 | v12; `UnsupportedVersion`; probing reports `WrongKey` > `Encrypted` > `UnsupportedVersion`; wrong-key detection by index SHA-1; allocation guards; invalid UTF-16 names don't panic | ✅ |
-| F4 | Writer: ✅ configurable block size, ✅ store entries that don't shrink; ⬜ levels per method, Oodle compressor/level | partial (M2) |
+| F4 | Writer: configurable block size, store entries that don't shrink, `CompressionOptions` (levels, Oodle compressor/level) | ✅ |
 | F5 | Streaming writes from a `Read`, with progress/cancel callback | M3 |
-| F6 | `PakWriter::remove`, add a compression method to an existing pak's slots, expose the original index offset for the undo tail, copy stored entries between paks | M1 (M4 for copy) |
+| F6 | `PakWriter` editing: `remove`, `rename_all`, `set_mount_point`, `set_compression*`, `paths`; `PakReader::index_offset`; new methods fill free footer slots | ✅ (copy stored entries between paks: M4) |
 | F7 | Block-by-block decompression on read | M3 |
 | F8 | Read v13–15 | M5 |
 | F9 | Entry SHA-1 verification | M3 |
@@ -481,7 +504,7 @@ Each change gets fork tests; generally useful ones are offered upstream.
 
 ## 10. Testing
 
-**Automated (33 tests, run on Windows CI on every push):**
+**Automated (48 tests, run on Windows CI on every push):**
 
 - Reading: synthetic round trips for None/Zlib/Gzip/Zstd/LZ4, v12, mount folders and
   attributes, future version refused, non-pak refused, null/bad handles, panic guard,
@@ -492,16 +515,23 @@ Each change gets fork tests; generally useful ones are offered upstream.
 - Packing: every compression round trip (incl. raw fallback), TC-style AddList with folders,
   SubPath, flattening + duplicate refusal, move-to-archive, unreadable source, version/
   compression refusal, missing Oodle, cancel (no partial pak), existing pak refused.
-- Options parsing; key parsing (hex/base64); pack planning.
+- Modifying: add/replace inside the mount, outside the mount (No → byte-identical, Yes →
+  re-rooted with game paths unchanged, panel root → bare base), F8 files / folders / mount
+  folders / no match, view-mode memory, cancel and read error → byte-identical rollback,
+  simulated crash → restore, pending undo refused, encrypted refused, new compression
+  slot.
+- Settings: ini writer (comments, order, CRLF, key variants), model ↔ ini round trip,
+  shipped ini = defaults, choices and warnings.
+- Options parsing; key parsing (hex/base64); pack planning; view mapping (incl. Unicode).
 - Optional env-driven tests (not in CI): `UEPAK_SAMPLES` (real paks), `UEPAK_KEYED_PAK` +
   `UEPAK_KEYED_KEY` (real encrypted pak; keys never committed), `UEPAK_DEBUG_PAK`
-  (diagnostic log for one file).
+  (diagnostic log for one file), `UEPAK_PARITY_PAK` (re-pack a reference pak and compare
+  bytes), `UEPAK_KEEP_PACKED` (keep written paks for inspection).
 
-**Manual / tooling:** Wine harness that drives the real key dialog; Python script checking
-the three index SHA-1s of written paks.
+**Manual / tooling:** Wine harnesses that drive the real key dialog and settings dialog;
+Python script checking the three index SHA-1s of new and modified paks.
 
-**Planned:** M1 modify flows (add, replace, delete all, cancel mid-write → byte-identical
-pak, undo-file recovery); M3 >4 GB and block-boundary cases.
+**Planned:** M3 >4 GB and block-boundary cases.
 
 **Real-world samples:**
 
@@ -514,6 +544,8 @@ pak, undo-file recovery); M3 >4 GB and block-boundary cases.
 | EndOfAbyss-Windows.pak | v12, encrypted index, Oodle | ✅ key validated by index SHA-1, 4,587 entries listed |
 | Encrypted entries with a plain index | per-entry decryption | synthetic only (repak test pak) |
 | v8B / v9 game pak | UE 4.23 – 4.25 | none available |
+| SML.pak (made by repak) | packing parity | ✅ plugin output byte-identical (806 bytes) |
+| G1R.pak (made by the plugin) | packing | ✅ valid; differs from SML.pak only by the chosen mount point |
 | Plugin-packed pak loaded by a game | packing end to end | to do (user) |
 | Oodle packing | Oodle compressor via DLL | to do (user, Windows) |
 
@@ -546,6 +578,8 @@ read-only plugin folder (log to clipboard, settings in the `wincmd.ini` folder).
    `Hidden`? The winner becomes the default.
 2. **Packing in the field:** Oodle packing on Windows, and a plugin-packed mod pak loaded
    by a game.
+3. **TC behaviour of modify flows:** confirm in TC that F5 into a pak / F8 refresh the
+   panel correctly and that the re-root question reads well.
 
 Resolved: compact = checkbox; `pluginst.inf` with `file=uepak.wcx64` works; key lookup =
 folder/parent then same non-zero GUID; both view modes with `Folder` default and the mount
