@@ -20,11 +20,42 @@ pub enum MountPointMode {
     Folder,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Windows attribute bits for mount folder entries (`MountFolderAttr`).
+pub const ATTR_READONLY: u32 = 0x1;
+pub const ATTR_HIDDEN: u32 = 0x2;
+pub const ATTR_SYSTEM: u32 = 0x4;
+
+#[derive(Debug, Clone)]
 pub struct Options {
     pub mount_point: MountPointMode,
+    /// Extra attributes on mount folders in `Folder` view, so TC can show them
+    /// differently: `ReadOnly` (default), `Hidden`, `System`, combinations
+    /// (`ReadOnly,Hidden`) or `None`.
+    pub mount_folder_attr: u32,
     /// `DebugLog=1`: write a diagnostic log (see `log.rs`).
     pub debug_log: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            mount_point: MountPointMode::default(),
+            mount_folder_attr: ATTR_READONLY,
+            debug_log: false,
+        }
+    }
+}
+
+pub fn parse_attr_list(value: &str) -> u32 {
+    value
+        .split([',', '|', '+', ' '])
+        .map(|v| match v.trim() {
+            "readonly" | "r" => ATTR_READONLY,
+            "hidden" | "h" => ATTR_HIDDEN,
+            "system" | "s" => ATTR_SYSTEM,
+            _ => 0,
+        })
+        .fold(0, |a, b| a | b)
 }
 
 static PLUGIN_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -116,6 +147,7 @@ pub fn parse_options(text: &str) -> Options {
                     _ => MountPointMode::Folder,
                 }
             }
+            "mountfolderattr" => opts.mount_folder_attr = parse_attr_list(&value),
             "debuglog" => opts.debug_log = matches!(value.as_str(), "1" | "true" | "yes" | "on"),
             _ => {}
         }
@@ -134,6 +166,19 @@ mod tests {
         let o = parse_options("; c\n[other]\nMountPoint=Root\n[options]\nmountpoint=root");
         assert_eq!(o.mount_point, MountPointMode::Root);
         assert_eq!(parse_options("").mount_point, MountPointMode::Folder);
+    }
+
+    #[test]
+    fn parses_mount_folder_attr() {
+        assert_eq!(Options::default().mount_folder_attr, ATTR_READONLY);
+        let o = parse_options("[Options]\nMountFolderAttr=Hidden");
+        assert_eq!(o.mount_folder_attr, ATTR_HIDDEN);
+        let o = parse_options("[Options]\nmount_folder_attr = ReadOnly, System");
+        assert_eq!(o.mount_folder_attr, ATTR_READONLY | ATTR_SYSTEM);
+        assert_eq!(
+            parse_options("[Options]\nMountFolderAttr=None").mount_folder_attr,
+            0
+        );
     }
 
     #[test]

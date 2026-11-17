@@ -33,12 +33,14 @@ Opening a pak with an encrypted file list asks for its key (64 hex digits, optio
 base64). A wrong key is detected and the dialog asks again. With "Remember" ticked the key
 is stored in `uepak.keys.json` (settings folder) for that folder and its subfolders; a key
 for a non-zero key GUID is also tried for paks with the same GUID elsewhere. Keys are never
-written to the log. Encrypted paks can't be modified.
+written to the log.
 
 ## Options (`uepak.ini`)
 
 - `MountPoint=Folder|Root` — show the mount point (without leading `../`) as top-level
   folders (default), or show contents relative to the mount point.
+- `MountFolderAttr=ReadOnly|Hidden|System|None` (combinations allowed) — attributes on the
+  mount point's folders in Folder view, to tell them apart from real folders.
 - `DebugLog=0|1` (also `debug_log`) — detailed diagnostic log in `uepak.log` in the plugin
   folder. If that folder is not writable the log is kept in memory and copied to the
   clipboard whenever an operation fails. Re-read on every archive open, no restart needed.

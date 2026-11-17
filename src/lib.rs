@@ -396,8 +396,8 @@ fn open_impl(name: Option<String>, mode: c_int, result: &mut c_int) -> Handle {
                 started.elapsed().as_millis(),
                 arc.pak().version(),
                 arc.pak().mount_point(),
-                arc.items.len(),
-                arc.pak().files().len() - arc.items.len(),
+                arc.file_count(),
+                arc.pak().files().len() - arc.file_count(),
                 arc.pak().used_compression(),
                 arc.pak().encrypted_index(),
             );
@@ -448,27 +448,50 @@ struct HeaderOut {
     pack: u64,
     unpack: u64,
     time: c_int,
+    attr: c_int,
 }
 
 fn next_header(arc: &mut Archive) -> Option<HeaderOut> {
     let time = arc.mtime.map(win::dos_time).unwrap_or(0);
+    let mount_attr = arc.mount_folder_attr as c_int;
     let Some(item) = arc.next_item() else {
+        let files = arc.file_count();
         dlog!(
-            "ReadHeader: end of archive after {} entries",
-            arc.items.len()
+            "ReadHeader: end of archive after {} entries ({} files)",
+            arc.items.len(),
+            files
         );
         return None;
+    };
+    let attr = if item.mount_dir {
+        FILE_ATTR_DIRECTORY | mount_attr
+    } else {
+        FILE_ATTR_ARCHIVE
     };
     Some(HeaderOut {
         name: item.display.clone(),
         pack: item.info.compressed_size,
         unpack: item.info.uncompressed_size,
         time,
+        attr,
     })
 }
 
 fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) -> c_int {
     if op == PK_SKIP {
+        return 0;
+    }
+    // Mount folders carry no data: just create the folder.
+    if let Some(item) = arc.current_item().filter(|i| i.mount_dir) {
+        dlog!("ProcessFile {} mount folder {}", op_name(op), item.display);
+        if op == PK_EXTRACT {
+            if let Some(dest) = &dest {
+                if let Err(e) = std::fs::create_dir_all(dest) {
+                    dlog!("  create folder failed: {e}");
+                    return E_ECREATE;
+                }
+            }
+        }
         return 0;
     }
     let display = arc
@@ -583,7 +606,7 @@ pub unsafe extern "system" fn ReadHeaderExW(h: Handle, hd: *mut HeaderDataExW) -
         hd.UnpSize = out.unpack as u32;
         hd.UnpSizeHigh = (out.unpack >> 32) as u32;
         hd.FileTime = out.time;
-        hd.FileAttr = FILE_ATTR_ARCHIVE;
+        hd.FileAttr = out.attr;
         0
     })
 }
@@ -814,7 +837,7 @@ pub unsafe extern "system" fn ReadHeaderEx(h: Handle, hd: *mut HeaderDataEx) -> 
         hd.UnpSize = out.unpack as u32;
         hd.UnpSizeHigh = (out.unpack >> 32) as u32;
         hd.FileTime = out.time;
-        hd.FileAttr = FILE_ATTR_ARCHIVE;
+        hd.FileAttr = out.attr;
         0
     })
 }
@@ -834,7 +857,7 @@ pub unsafe extern "system" fn ReadHeader(h: Handle, hd: *mut HeaderData) -> c_in
         hd.PackSize = out.pack.min(i32::MAX as u64) as i32;
         hd.UnpSize = out.unpack.min(i32::MAX as u64) as i32;
         hd.FileTime = out.time;
-        hd.FileAttr = FILE_ATTR_ARCHIVE;
+        hd.FileAttr = out.attr;
         0
     })
 }

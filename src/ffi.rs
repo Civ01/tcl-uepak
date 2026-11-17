@@ -38,6 +38,7 @@ pub const PK_CAPS_HIDE: c_int = 256;
 pub const PK_CAPS_ENCRYPT: c_int = 512;
 
 pub const FILE_ATTR_ARCHIVE: c_int = 0x20;
+pub const FILE_ATTR_DIRECTORY: c_int = 0x10;
 
 pub type ProcessDataProcW = Option<unsafe extern "system" fn(*mut u16, c_int) -> c_int>;
 pub type ProcessDataProcA = Option<unsafe extern "system" fn(*mut c_char, c_int) -> c_int>;

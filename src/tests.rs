@@ -14,9 +14,15 @@ struct Listed {
     name: String,
     pack: u64,
     unpack: u64,
+    attr: i32,
 }
 
+/// Files only (mount folder entries filtered out).
 fn list(path: &Path) -> Result<Vec<Listed>, i32> {
+    list_all(path).map(|v| v.into_iter().filter(|l| l.attr & 0x10 == 0).collect())
+}
+
+fn list_all(path: &Path) -> Result<Vec<Listed>, i32> {
     let name = wide(&path.to_string_lossy());
     let mut data = OpenArchiveDataW {
         ArcName: name.as_ptr(),
@@ -44,6 +50,7 @@ fn list(path: &Path) -> Result<Vec<Listed>, i32> {
             name: String::from_utf16(&hd.FileName[..end]).unwrap(),
             pack: hd.PackSize as u64 | (hd.PackSizeHigh as u64) << 32,
             unpack: hd.UnpSize as u64 | (hd.UnpSizeHigh as u64) << 32,
+            attr: hd.FileAttr,
         });
         assert_eq!(
             unsafe { ProcessFileW(h, PK_SKIP, std::ptr::null(), std::ptr::null()) },
@@ -84,6 +91,10 @@ fn extract_all(path: &Path, dest: &Path) -> Vec<(String, Vec<u8>)> {
             unsafe { ProcessFileW(h, PK_TEST, std::ptr::null(), std::ptr::null()) },
             0
         );
+        if hd.FileAttr & 0x10 != 0 {
+            assert!(target.is_dir(), "mount folder {rel} created");
+            continue;
+        }
         out.push((rel, std::fs::read(&target).unwrap()));
     }
     unsafe { CloseArchive(h) };
@@ -490,4 +501,44 @@ fn real_encrypted_pak_from_env() {
     let listed = list(&pak).unwrap();
     println!("{}: {} entries listed with key", p, listed.len());
     crate::keys::clear_session();
+}
+
+#[test]
+fn mount_folders_are_listed_with_marker_attribute() {
+    let dir = tmp("mountdirs");
+    let pak = dir.join("m.pak");
+    make_pak(&pak, None, &payload());
+    let all = list_all(&pak).unwrap();
+    let dirs: Vec<_> = all.iter().filter(|l| l.attr & 0x10 != 0).collect();
+    assert_eq!(
+        dirs.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+        ["TestGame", "TestGame\\Content"]
+    );
+    assert!(
+        dirs.iter().all(|l| l.attr == 0x10 | 0x1),
+        "DIRECTORY|READONLY by default"
+    );
+    assert!(all
+        .iter()
+        .filter(|l| l.attr & 0x10 == 0)
+        .all(|l| l.attr == 0x20));
+    // extraction creates them as plain folders
+    let out = extract_all(&pak, &dir.join("out"));
+    assert_eq!(out.len(), payload().len());
+    assert!(dir.join("out/TestGame/Content").is_dir());
+}
+
+#[test]
+fn root_mount_point_has_no_mount_folders() {
+    let dir = tmp("rootmount");
+    let pak = dir.join("r.pak");
+    make_pak_v(&pak, repak::Version::V11, &payload());
+    // mount "../../../G/" -> one folder "G"
+    assert_eq!(list_all(&pak).unwrap().len(), payload().len() + 1);
+    let pak2 = dir.join("r2.pak");
+    let f = std::io::BufWriter::new(std::fs::File::create(&pak2).unwrap());
+    let mut w = repak::PakBuilder::new().writer(f, repak::Version::V11, "../../../".into(), None);
+    w.write_file("a.txt", false, b"x").unwrap();
+    w.write_index().unwrap();
+    assert_eq!(list_all(&pak2).unwrap().len(), 1, "nothing visible to show");
 }

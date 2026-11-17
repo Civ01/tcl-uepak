@@ -41,6 +41,9 @@ pub struct Item {
     /// Path shown to TC (`\`-separated, optional mount point prefix).
     pub display: String,
     pub info: EntryInfo,
+    /// A folder of the mount point's visible part (`Folder` view only): listed
+    /// explicitly so it can carry marker attributes. Has no data.
+    pub mount_dir: bool,
 }
 
 pub struct Archive {
@@ -60,6 +63,8 @@ pub struct Archive {
     pub key: Option<crate::keys::AesKey>,
     /// Set once a key prompt for encrypted entries was cancelled on this handle.
     pub key_declined: bool,
+    /// Attributes for mount folder entries (from options at open time).
+    pub mount_folder_attr: u32,
 }
 
 /// Turns `../../../Game/Content/` into `Game\Content` (empty if nothing left).
@@ -111,7 +116,29 @@ impl Archive {
             MountPointMode::Root => String::new(),
             MountPointMode::Folder => mount_prefix(pak.mount_point()),
         };
-        let items = pak
+        // Mount folders first: "TheIsle", "TheIsle\Content".
+        let mut items: Vec<Item> = vec![];
+        let mut acc = String::new();
+        for seg in prefix.split('\\').filter(|s| !s.is_empty()) {
+            if !acc.is_empty() {
+                acc.push('\\');
+            }
+            acc.push_str(seg);
+            items.push(Item {
+                pak_path: String::new(),
+                display: acc.clone(),
+                info: EntryInfo {
+                    offset: 0,
+                    compressed_size: 0,
+                    uncompressed_size: 0,
+                    compression: None,
+                    encrypted: false,
+                    timestamp: None,
+                },
+                mount_dir: true,
+            });
+        }
+        let files: Vec<Item> = pak
             .entries()
             .filter(|(p, _)| is_safe_relative(p))
             .map(|(p, info)| {
@@ -125,9 +152,11 @@ impl Archive {
                     pak_path: p.to_string(),
                     display,
                     info,
+                    mount_dir: false,
                 }
             })
             .collect();
+        items.extend(files);
 
         Ok(Archive {
             path: path.to_path_buf(),
@@ -140,6 +169,7 @@ impl Archive {
             oodle_warned: false,
             key: key.copied(),
             key_declined: false,
+            mount_folder_attr: options.mount_folder_attr,
         })
     }
 
@@ -153,6 +183,11 @@ impl Archive {
 
     pub fn pak(&self) -> &PakReader {
         &self.pak
+    }
+
+    /// Number of real file entries (excludes mount folders).
+    pub fn file_count(&self) -> usize {
+        self.items.iter().filter(|i| !i.mount_dir).count()
     }
 
     pub fn uses_oodle(&self) -> bool {

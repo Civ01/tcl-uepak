@@ -20,10 +20,8 @@ behaviour that already exists in the skeleton; everything else is planned.
 **Non-goals**
 
 - IoStore containers (`.utoc` / `.ucas`). Separate project.
-- Writing encrypted paks or encrypted entries. Encryption is **read-only**: keys are only
-  used to read. (An AES key is symmetric and could encrypt too, but mods don't need
-  encrypted paks, and games that verify paks do it with signatures, which a key doesn't
-  provide.) Modifying an encrypted pak is refused.
+- Creating **new** encrypted paks. Existing encrypted paks can be modified (§4.4); the
+  AES key is symmetric, so the key that reads a pak can also write it.
 - Pak signing (`.sig` files). A modified signed pak will fail signature checks in games
   that enforce them; this is documented, not handled.
 - 32-bit Total Commander.
@@ -116,12 +114,19 @@ visible part `TheIsle/Content`.
 | `Folder` (**default**) | the visible part as folders: `TheIsle\Content\…` | see where files land in the game; extraction gives the same layout as `repak unpack` |
 | `Root` | the contents of the mount point: `Hiraeth\…`, `TheIsle\…` | work inside the mount point only |
 
-**Mount folders** (`Folder` mode only): every folder of the visible part is listed as an
-explicit directory entry with attributes `DIRECTORY | READONLY` (planned). They can be told
-apart with a TC colour rule on the `r` attribute for directories (Configuration → Colours →
-by file type). Names are never decorated (no `<…>`): the shown names travel back into
-extraction paths and `DeleteList`, and `<` `>` aren't valid in Windows file names.
-*To verify in TC: plugin-returned directory entries with READONLY take the colour.*
+**Mount folders** (`Folder` mode only) **[done]**: every folder of the visible part is
+listed as an explicit directory entry with `DIRECTORY` plus the attributes from
+`[Options] MountFolderAttr` (default `ReadOnly`; also `Hidden`, `System`, combinations,
+`None`). Real folders are only implied by file paths, so they carry no attributes.
+Ways to see the difference in TC:
+- `ReadOnly`: a colour rule (Configuration → Colours → define colours by file type) whose
+  search template requires both *Directory* and *Read only*.
+- `Hidden`: TC draws hidden items dimmed when hidden files are shown; no rule needed, but
+  the mount folders disappear when hidden files are not shown.
+Extracting a mount folder just creates the folder (no attributes are applied). Names are
+never decorated (no `<…>`): the shown names travel back into extraction paths and
+`DeleteList`, and `<` `>` aren't valid in Windows file names.
+*To verify in TC: which marker works best.*
 
 **Mode consistency:** the plugin remembers, per archive path, which mode its last listing
 used, and maps `PackFiles` / `DeleteFiles` paths with that mode. Switching the mode in
@@ -313,8 +318,17 @@ index and footer are written. Replaced data stays in the file as dead space.
   free, or the version is < 8 and the method isn't Zlib/Gzip/Oodle, abort with a message.
 - **Replace:** an entry with the same path is replaced. TC does not ask for confirmation
   for plugins; the log records it.
-- **Refused, read-only message:** paks with an encrypted index or encrypted entries,
-  v9 paks with a frozen index, versions repak cannot write.
+- **Encrypted paks:** allowed after a confirmation:
+
+  > You are trying to add files to an encrypted pak. The new files and the pak's index
+  > will be encrypted with the same key. Continue?
+
+  - The key comes from the same lookup as reading (§3.5); no key → the key prompt.
+  - New entries are encrypted when the pak's existing entries are (any encrypted entry
+    counts); the index is re-encrypted when it was encrypted. The footer keeps its key
+    GUID and stores the SHA-1 of the plain index, as Unreal expects.
+  - The same applies to `DeleteFiles` (index re-encrypted) and to compact rebuilds.
+- **Refused, read-only message:** v9 paks with a frozen index, versions repak cannot write.
 - **Crash safety (transactional append):**
   1. Before writing, copy the original tail (`index_offset … EOF`: index + footer) to
      `<pak>.uepak-undo` next to the pak, and keep the original length.
@@ -343,7 +357,8 @@ index and footer are written. Replaced data stays in the file as dead space.
 - Only the index is rewritten (same transactional procedure as §4.4); data becomes dead
   space.
 - Deleting every entry leaves a valid, empty pak.
-- The same refusals as §4.4 apply (encrypted, frozen, unwritable versions).
+- The same rules as §4.4 apply (confirmation for encrypted paks; frozen and unwritable
+  versions refused).
 
 ### 4.6 Compression methods for writing
 
@@ -412,6 +427,8 @@ units.
 [Options]
 ; Browsing: Folder = mount point shown as folders (default), Root = contents of the mount point
 MountPoint=Folder
+; attributes on mount folders in Folder view: ReadOnly | Hidden | System | None (combinable)
+MountFolderAttr=ReadOnly
 ; 1 = write uepak.log (see SPEC §7)
 DebugLog=0
 
@@ -487,6 +504,7 @@ background-safe path. Tracked as an open item.
 | F7 | Block-by-block decompression on read (constant memory), with progress | §3.3 |
 | F8 | Read versions 13, 14, 15 (flat directory index, pakchunk index, encryption method + IVs) | §3.1 |
 | F9 | Entry SHA-1 verification API | `PK_TEST` |
+| F10 | AES writing: encrypted index (plain-index SHA-1 in footer, key GUID kept), encrypted entries (each compression block / uncompressed data padded to 16 bytes, AES-256-ECB, as Unreal does); round-trip tests against repak's encrypted test paks and real game paks | §4.4 encrypted paks |
 
 Each change gets tests in the fork (round-trip per version × method), and is offered
 upstream where it's generally useful.
@@ -517,8 +535,8 @@ upstream where it's generally useful.
 | zlib_4.22.pak (2,959 entries) | v8A, Zlib | ✅ lists, extracts |
 | Oodle_unecrypted_5.4.pak | v11, Oodle | ✅ lists; extraction to verify on Windows with the DLL |
 | oodle_extra_5.9.2.pak | v11, Oodle | ✅ lists; extraction to verify on Windows with the DLL |
-| encrypted_5.6.pak | v11, encrypted index, Oodle | ✅ refused cleanly; needs §3.5 + key |
-| EndOfAbyss-Windows.pak | v12, encrypted index, Oodle | ✅ refused cleanly; needs §3.5 + key |
+| encrypted_5.6.pak | v11, encrypted index, Oodle | ✅ lists + extracts with key (user-tested in TC) |
+| EndOfAbyss-Windows.pak | v12, encrypted index, Oodle | ✅ key validated by index SHA-1; 4,587 entries listed |
 | Encrypted entries, plain index | per-entry decryption | needed |
 | v8B / v9 game pak | 4.23 – 4.25 | needed (none available yet) |
 | v13+ pak | new formats | none exist in the wild yet |
@@ -548,8 +566,8 @@ folder).
 
 ## 12. Open items
 
-1. **Mount folder colouring** (§3.2): verify that TC colours plugin-returned READONLY
-   directory entries, and that extraction ignores the attribute.
+1. **Mount folder marker** (§3.2): verify in TC whether `ReadOnly` + colour rule or
+   `Hidden` works better, and make that the default.
 
 Resolved:
 - Compact = checkbox (§4.4).
@@ -559,3 +577,4 @@ Resolved:
   mode (§3.2, §4.2.1).
 - TC argument formats captured (§11).
 - Background operations: after packing is stable (§8.1).
+- Encrypted paks: modifiable after a confirmation; no new encrypted paks (§4.4).
