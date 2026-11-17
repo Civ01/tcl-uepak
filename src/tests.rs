@@ -181,9 +181,30 @@ fn rejects_non_pak() {
 }
 
 #[test]
-fn caps_are_read_only() {
-    let caps = GetPackerCaps();
-    assert_eq!(caps & (PK_CAPS_NEW | PK_CAPS_MODIFY | PK_CAPS_DELETE), 0);
+fn pack_and_delete_stubs_record_and_refuse() {
+    let pak = wide("C:\\x\\new.pak");
+    let src = wide("C:\\src\\");
+    // "a.txt\0dir\\b.txt\0\0"
+    let list: Vec<u16> = "a.txt\0dir\\b.txt\0\0".encode_utf16().collect();
+    assert_eq!(
+        unsafe { win::from_wide_multi(list.as_ptr()) },
+        vec!["a.txt", "dir\\b.txt"]
+    );
+    let r = unsafe {
+        PackFilesW(
+            pak.as_ptr(),
+            std::ptr::null(),
+            src.as_ptr(),
+            list.as_ptr(),
+            2,
+        )
+    };
+    assert_eq!(r, E_NOT_SUPPORTED);
+    assert_eq!(
+        unsafe { DeleteFilesW(pak.as_ptr(), list.as_ptr()) },
+        E_NOT_SUPPORTED
+    );
+    assert!(unsafe { win::from_wide_multi(std::ptr::null()) }.is_empty());
 }
 
 #[test]
@@ -191,20 +212,53 @@ fn sample_paks() {
     let Ok(dir) = std::env::var("UEPAK_SAMPLES") else {
         return;
     };
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let p = entry.unwrap().path();
-        if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pak")) {
-            let listed = list(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-            let total: u64 = listed.iter().map(|l| l.unpack).sum();
-            println!("{}: {} entries, {} bytes", p.display(), listed.len(), total);
-            let out_dir = tmp("sample");
-            let out = extract_all(&p, &out_dir);
-            assert_eq!(out.len(), listed.len());
-            for (l, (_, data)) in listed.iter().zip(&out) {
-                assert_eq!(l.unpack, data.len() as u64, "{}", l.name);
-            }
-            let _ = std::fs::remove_dir_all(&out_dir);
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pak")))
+        .collect();
+    paths.sort();
+    for p in paths {
+        let sniff = archive::sniff_footer(&p).expect("footer");
+        if sniff.encrypted_index == Some(true) {
+            assert_eq!(list(&p).err(), Some(E_NOT_SUPPORTED), "{}", p.display());
+            println!(
+                "{}: encrypted index -> E_NOT_SUPPORTED (expected)",
+                p.display()
+            );
+            continue;
         }
+        let listed = list(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        let total: u64 = listed.iter().map(|l| l.unpack).sum();
+        let oodle = sniff
+            .compression
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("oodle"));
+        if oodle && oodle_loader::oodle().is_err() {
+            println!(
+                "{}: v{} {} entries, {} bytes (Oodle lib unavailable: listed only)",
+                p.display(),
+                sniff.version,
+                listed.len(),
+                total
+            );
+            continue;
+        }
+        let out_dir = tmp("sample");
+        let out = extract_all(&p, &out_dir);
+        assert_eq!(out.len(), listed.len());
+        for (l, (_, data)) in listed.iter().zip(&out) {
+            assert_eq!(l.unpack, data.len() as u64, "{}", l.name);
+        }
+        println!(
+            "{}: v{} [{}] {} entries, {} bytes extracted + tested",
+            p.display(),
+            sniff.version,
+            sniff.compression.join(","),
+            listed.len(),
+            total
+        );
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 }
 
@@ -302,7 +356,9 @@ fn debug_log_writes_to_plugin_dir() {
 /// opens one pak with debug logging on and prints the result code.
 #[test]
 fn debug_open_env_pak() {
-    let Ok(p) = std::env::var("UEPAK_DEBUG_PAK") else { return };
+    let Ok(p) = std::env::var("UEPAK_DEBUG_PAK") else {
+        return;
+    };
     crate::log::FORCE.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::log::configure(true);
     crate::log_environment(&crate::config::Options::default());

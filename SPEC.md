@@ -84,12 +84,13 @@ PK_CAPS_BY_CONTENT | PK_CAPS_SEARCHTEXT`. Not set: `PK_CAPS_ENCRYPT`, `PK_CAPS_M
 | 9 (frozen index) | 4.25 | supported, except paks with a frozen index |
 | 10–11 | 4.26 – 5.x | supported |
 | 12 `Utf8PakDirectory` | 5.3+ | supported (same layout as 11) |
-| 13 `SortedDirectoryIndex` | newer UE5 / UE6 | **planned** (fork work: flat directory index) |
-| 14 `PakchunkIndex` | newer | **planned** (extra footer field) |
-| 15 `EncryptionMethod` | newer | **planned** (encryption method + IVs in footer) |
+| 13 `SortedDirectoryIndex` | newer UE5 / UE6 | **planned, low priority** (fork work: flat directory index) |
+| 14 `PakchunkIndex` | newer | **planned, low priority** (extra footer field) |
+| 15 `EncryptionMethod` | newer | **planned, low priority** (encryption method + IVs in footer) |
 | unknown / newer | — | refused with "PAK version N is newer than this plugin supports" **[done]** |
 
 The CUE4Parse `EPakFileVersion` and `FPakInfo` sources are the reference for versions 13–15.
+No v13+ pak has been seen in the wild so far: games built with UE 5.8.4 still ship v11.
 
 | Compression | Read |
 |---|---|
@@ -250,8 +251,13 @@ index and footer are written. Replaced data stays in the file as dead space.
      write the saved tail back, delete the undo file.
   4. On open, if `<pak>.uepak-undo` exists (TC or the machine died mid-write), offer to
      restore the pak to its previous state.
-- **Dead space:** recorded nowhere; it grows with each replace or delete. A
-  "Compact (rebuild) when modifying" option is an open item (§10).
+- **Dead space:** recorded nowhere; it grows with each replace or delete.
+- **Compact when modifying** (dialog checkbox, `[Pack] Compact=0|1`, default off): instead
+  of appending, rebuild the pak. Write a new pak next to the original (`<pak>.uepak-new`)
+  containing the kept entries (copied as stored: no recompression, compressed blocks are
+  reused) plus the new ones, then replace the original with the new file. No dead space;
+  costs a full rewrite. The original is untouched until the final rename, so no undo file
+  is needed. Also applies to `DeleteFiles`.
 
 ### 4.5 Deleting
 
@@ -300,6 +306,7 @@ units.
 │   Level           [Normal                        ▼]   │
 │   Oodle compressor[Mermaid                       ▼]   │
 │   Block size      [64 KB                         ▼]   │
+│   [ ] Compact when modifying (rewrite whole pak)      │
 │   ⚠ (warning line for Zstd/LZ4/large blocks/missing Oodle DLL)
 │                                                       │
 │ Browsing                                              │
@@ -345,6 +352,8 @@ Level=
 OodleCompressor=Mermaid
 ; bytes
 BlockSize=65536
+; 1 = rebuild the whole pak when adding/replacing/deleting (no dead space)
+Compact=0
 ```
 
 - Keys are case-insensitive and ignore `_` (`DebugLog` = `debug_log`). **[done]**
@@ -399,7 +408,7 @@ background-safe path. Tracked as an open item.
 | F3 | ✅ v12, `UnsupportedVersion`, clear `Encrypted` error | reading |
 | F4 | Compression settings: level per method, Oodle compressor + level, block size, uncompressed fallback when not smaller | §4.3, §4.6, §4.7 |
 | F5 | Streaming writes from a `Read` (block by block) with a progress / cancel callback | large files, progress |
-| F6 | `PakWriter::remove(path)`; adding a compression method to an existing pak's footer slots; expose original `index_offset` for the undo tail | §4.4, §4.5 |
+| F6 | `PakWriter::remove(path)`; adding a compression method to an existing pak's footer slots; expose original `index_offset` for the undo tail; copy an entry's stored bytes into another pak without recompressing (compact) | §4.4, §4.5 |
 | F7 | Block-by-block decompression on read (constant memory), with progress | §3.3 |
 | F8 | Read versions 13, 14, 15 (flat directory index, pakchunk index, encryption method + IVs) | §3.1 |
 | F9 | Entry SHA-1 verification API | `PK_TEST` |
@@ -427,16 +436,18 @@ upstream where it's generally useful.
 
 | Sample | Covers | Have |
 |---|---|---|
-| UE4.27 mod pak | v11, uncompressed | ✅ |
-| UE5.1 mod pak | v11, uncompressed | ✅ |
-| UE5.8 config pak | v11, tiny | ✅ |
-| EndOfAbyss-Windows.pak | v12, encrypted index, Oodle | ✅ (needs its key) |
-| Zlib-compressed game pak | Zlib read | needed |
-| Oodle, unencrypted | Oodle read without a key | needed |
+| UE4.27 mod pak | v11, uncompressed | ✅ lists, extracts |
+| UE5.1 mod pak | v11, uncompressed | ✅ lists, extracts |
+| UE5.8 config pak | v11, tiny | ✅ lists, extracts |
+| zlib_4.22.pak (2,959 entries) | v8A, Zlib | ✅ lists, extracts |
+| Oodle_unecrypted_5.4.pak | v11, Oodle | ✅ lists; extraction to verify on Windows with the DLL |
+| oodle_extra_5.9.2.pak | v11, Oodle | ✅ lists; extraction to verify on Windows with the DLL |
+| encrypted_5.6.pak | v11, encrypted index, Oodle | ✅ refused cleanly; needs §3.5 + key |
+| EndOfAbyss-Windows.pak | v12, encrypted index, Oodle | ✅ refused cleanly; needs §3.5 + key |
 | Encrypted entries, plain index | per-entry decryption | needed |
-| UE 4.22–4.25 game pak | v8A / v8B / v9 | needed |
-| v13+ pak | new formats | needed |
-| >4 GB pak | 64-bit sizes | needed |
+| v8B / v9 game pak | 4.23 – 4.25 | needed (none available yet) |
+| v13+ pak | new formats | none exist in the wild yet |
+| >4 GB pak | 64-bit sizes | synthetic (nightly CI) |
 
 **In TC, by hand, per release:** install via `pluginst.inf`; browse; F5 extract; Alt+F5 new
 pak; F5 into an open pak; F8 delete; Configure dialog; Ctrl+PgDn on a renamed pak; text
@@ -447,9 +458,12 @@ folder).
 
 ## 11. Open items
 
-1. **Compact rebuild:** add a "Compact when modifying" checkbox (full rewrite, no dead
-   space), or a separate action?
-2. **Background operations** (§8.1): worth enabling once packing is stable?
-3. **Key fallback by GUID** (§3.5 step 2): keep, or folder-only?
-4. **TC `DeleteList` format for folders:** verify `dir\*.*` handling against real TC.
-5. **`pluginst.inf` with `file=uepak.wcx64`:** verify auto-install in TC 11 x64.
+1. **Background operations** (§8.1): worth enabling once packing is stable?
+2. **Key fallback by GUID** (§3.5 step 2): keep, or folder-only?
+3. **TC `PackFiles` / `DeleteFiles` argument formats:** capture with the logging stubs
+   (current build: the calls are recorded and refused) for: F8 on files, F8 on a folder,
+   F5 from a panel into an open pak (root and subfolder), Alt+F5 with and without
+   "pack path names" and "move to archive".
+
+Resolved: compact = checkbox (§4.4); `pluginst.inf` with `file=uepak.wcx64` installs in
+TC 11 x64.

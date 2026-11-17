@@ -475,7 +475,138 @@ pub extern "system" fn SetChangeVolProcW(_h: Handle, _proc: ChangeVolProcW) {}
 
 #[no_mangle]
 pub extern "system" fn GetPackerCaps() -> c_int {
-    PK_CAPS_MULTIPLE | PK_CAPS_BY_CONTENT
+    // NEW/MODIFY/DELETE/OPTIONS are advertised so TC routes Alt+F5, F5-into-pak,
+    // F8 and "Configure" to the plugin; for now those calls are only recorded
+    // (see `report_unimplemented`). TC caches caps: reinstall after changes.
+    PK_CAPS_NEW
+        | PK_CAPS_MODIFY
+        | PK_CAPS_MULTIPLE
+        | PK_CAPS_DELETE
+        | PK_CAPS_OPTIONS
+        | PK_CAPS_BY_CONTENT
+}
+
+/// Records a call to a not-yet-implemented operation: always copies the
+/// details to the clipboard (so they can be pasted without DebugLog), writes
+/// them to the debug log if enabled, and tells the user.
+fn report_unimplemented(what: &str, details: &str) {
+    dlog!("{what} (not implemented yet):\n{details}");
+    let copied = win::copy_to_clipboard(&format!("uepak: {what}\n{details}"));
+    let preview: String = details.lines().take(25).collect::<Vec<_>>().join("\n");
+    let more = details.lines().count().saturating_sub(25);
+    win::warn(&format!(
+        "{what} is not implemented yet.\n\nWhat Total Commander passed:\n{preview}{}\n\n{}",
+        if more > 0 {
+            format!("\n... ({more} more lines)")
+        } else {
+            String::new()
+        },
+        if copied {
+            "Full details copied to the clipboard."
+        } else {
+            "Could not copy the details to the clipboard."
+        }
+    ));
+}
+
+fn describe_list(items: &[String]) -> String {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("  [{i}] {s:?}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn pack_flags(flags: c_int) -> String {
+    let mut v = vec![];
+    if flags & 1 != 0 {
+        v.push("MOVE_FILES");
+    }
+    if flags & 2 != 0 {
+        v.push("SAVE_PATHS");
+    }
+    if flags & 4 != 0 {
+        v.push("ENCRYPT");
+    }
+    format!("{flags} [{}]", v.join("|"))
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn PackFilesW(
+    packed_file: *const u16,
+    sub_path: *const u16,
+    src_path: *const u16,
+    add_list: *const u16,
+    flags: c_int,
+) -> c_int {
+    guard(E_NOT_SUPPORTED, "PackFilesW", || {
+        init();
+        let packed = win::from_wide_ptr(packed_file);
+        let exists = packed.as_deref().is_some_and(|p| Path::new(p).exists());
+        let items = win::from_wide_multi(add_list);
+        let details = format!(
+            "PackedFile: {packed:?} (exists: {exists})\nSubPath: {:?}\nSrcPath: {:?}\nFlags: {}\nAddList ({} items):\n{}",
+            win::from_wide_ptr(sub_path),
+            win::from_wide_ptr(src_path),
+            pack_flags(flags),
+            items.len(),
+            describe_list(&items)
+        );
+        report_unimplemented("PackFiles", &details);
+        E_NOT_SUPPORTED
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn DeleteFilesW(
+    packed_file: *const u16,
+    delete_list: *const u16,
+) -> c_int {
+    guard(E_NOT_SUPPORTED, "DeleteFilesW", || {
+        init();
+        let items = win::from_wide_multi(delete_list);
+        let details = format!(
+            "PackedFile: {:?}\nDeleteList ({} items):\n{}",
+            win::from_wide_ptr(packed_file),
+            items.len(),
+            describe_list(&items)
+        );
+        report_unimplemented("DeleteFiles", &details);
+        E_NOT_SUPPORTED
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn ConfigurePacker(parent: *mut c_void, dll_instance: *mut c_void) {
+    guard((), "ConfigurePacker", || {
+        init();
+        report_unimplemented(
+            "ConfigurePacker (settings dialog)",
+            &format!("Parent: {parent:?}\nDllInstance: {dll_instance:?}"),
+        );
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn PackFiles(
+    _packed_file: *const c_char,
+    _sub_path: *const c_char,
+    _src_path: *const c_char,
+    _add_list: *const c_char,
+    _flags: c_int,
+) -> c_int {
+    dlog!("PackFiles (ANSI) called; only the Unicode version is supported");
+    E_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub extern "system" fn DeleteFiles(
+    _packed_file: *const c_char,
+    _delete_list: *const c_char,
+) -> c_int {
+    dlog!("DeleteFiles (ANSI) called; only the Unicode version is supported");
+    E_NOT_SUPPORTED
 }
 
 #[no_mangle]

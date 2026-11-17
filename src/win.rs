@@ -35,6 +35,32 @@ pub unsafe fn from_wide_ptr(p: *const u16) -> Option<String> {
     Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)))
 }
 
+/// Reads a TC-style list: NUL-separated UTF-16 strings ending with an empty one.
+///
+/// # Safety
+/// `p` must be null or point to a double-NUL-terminated UTF-16 list.
+pub unsafe fn from_wide_multi(p: *const u16) -> Vec<String> {
+    let mut out = vec![];
+    if p.is_null() {
+        return out;
+    }
+    let mut cur = p;
+    loop {
+        let mut len = 0;
+        while *cur.add(len) != 0 {
+            len += 1;
+        }
+        if len == 0 {
+            break;
+        }
+        out.push(String::from_utf16_lossy(std::slice::from_raw_parts(
+            cur, len,
+        )));
+        cur = cur.add(len + 1);
+    }
+    out
+}
+
 /// Copies `s` into a fixed UTF-16 buffer, truncating and NUL-terminating.
 pub fn copy_wide(dst: &mut [u16], s: &str) {
     let mut n = 0;
@@ -154,13 +180,13 @@ mod imp {
 
     /// Puts `text` on the clipboard as Unicode text. Returns success.
     pub fn copy_to_clipboard(text: &str) -> bool {
+        use windows_sys::Win32::Foundation::GlobalFree;
         use windows_sys::Win32::System::DataExchange::{
             CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
         };
         use windows_sys::Win32::System::Memory::{
             GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
         };
-        use windows_sys::Win32::Foundation::GlobalFree;
         const CF_UNICODETEXT: u32 = 13;
         let data = wide(&text.replace("\r\n", "\n").replace('\n', "\r\n"));
         let bytes = data.len() * 2;
