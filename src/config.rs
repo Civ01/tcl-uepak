@@ -36,6 +36,19 @@ pub enum PackCompression {
     Lz4,
 }
 
+impl std::fmt::Display for PackCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "None",
+            Self::Zlib => "Zlib",
+            Self::Gzip => "Gzip",
+            Self::Oodle => "Oodle",
+            Self::Zstd => "Zstd",
+            Self::Lz4 => "LZ4",
+        })
+    }
+}
+
 impl PackCompression {
     pub fn parse(v: &str) -> Option<Self> {
         Some(match v.trim().to_ascii_lowercase().as_str() {
@@ -321,6 +334,11 @@ pub fn parse_options(text: &str) -> Options {
         }
         let Some((key, value)) = line.split_once('=') else {
             continue;
+        };
+        // inline comments: "Key=Value   ; comment"
+        let value = match value.find([';', '#']) {
+            Some(i) if i > 0 && value[..i].ends_with([' ', '\t']) => &value[..i],
+            _ => value,
         };
         if section == "pack" {
             let key = key.trim().to_ascii_lowercase().replace('_', "");

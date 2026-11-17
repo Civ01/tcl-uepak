@@ -172,7 +172,7 @@ pub fn check_settings(opts: &PackOptions) -> Result<(), String> {
         )
     {
         return Err(format!(
-            "{c:?} compression needs PAK version V8A (UE 4.22) or newer; {} only supports Zlib, Gzip and Oodle.",
+            "{c} compression needs PAK version V8A (UE 4.22) or newer; {} only supports Zlib, Gzip and Oodle.",
             opts.version
         ));
     }

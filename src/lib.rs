@@ -17,6 +17,7 @@ mod modify;
 mod pack;
 mod progress;
 mod read;
+pub mod settings;
 pub mod view;
 pub mod win;
 
@@ -245,29 +246,6 @@ pub extern "system" fn GetPackerCaps() -> c_int {
         | PK_CAPS_BY_CONTENT
 }
 
-/// Records a call to a not-yet-implemented operation: always copies the
-/// details to the clipboard (so they can be pasted without DebugLog), writes
-/// them to the debug log if enabled, and tells the user.
-fn report_unimplemented(what: &str, details: &str) {
-    dlog!("{what} (not implemented yet):\n{details}");
-    let copied = win::copy_to_clipboard(&format!("uepak: {what}\n{details}"));
-    let preview: String = details.lines().take(25).collect::<Vec<_>>().join("\n");
-    let more = details.lines().count().saturating_sub(25);
-    win::warn(&format!(
-        "{what} is not implemented yet.\n\nWhat Total Commander passed:\n{preview}{}\n\n{}",
-        if more > 0 {
-            format!("\n... ({more} more lines)")
-        } else {
-            String::new()
-        },
-        if copied {
-            "Full details copied to the clipboard."
-        } else {
-            "Could not copy the details to the clipboard."
-        }
-    ));
-}
-
 fn describe_list(items: &[String]) -> String {
     items
         .iter()
@@ -474,13 +452,15 @@ pub unsafe extern "system" fn DeleteFilesW(
 }
 
 #[no_mangle]
-pub extern "system" fn ConfigurePacker(parent: *mut c_void, dll_instance: *mut c_void) {
+pub extern "system" fn ConfigurePacker(parent: *mut c_void, _dll_instance: *mut c_void) {
     guard((), "ConfigurePacker", || {
         init();
-        report_unimplemented(
-            "ConfigurePacker (settings dialog)",
-            &format!("Parent: {parent:?}\nDllInstance: {dll_instance:?}"),
-        );
+        dlog!("ConfigurePacker (parent {parent:?})");
+        let saved = dialog::configure(parent);
+        dlog!("  settings dialog closed, saved: {saved}");
+        if saved {
+            reload_options();
+        }
     })
 }
 
