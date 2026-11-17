@@ -28,8 +28,8 @@ deps\            third-party codec DLLs, e.g. oo2core_9_win64.dll for Oodle
 
 ## Options (`uepak.ini`)
 
-- `MountPoint=Root|Folder` — show contents relative to the pak's mount point,
-  or with the mount point (without leading `../`) as top-level folders.
+- `MountPoint=Folder|Root` — show the mount point (without leading `../`) as top-level
+  folders (default), or show contents relative to the mount point.
 - `DebugLog=0|1` (also `debug_log`) — detailed diagnostic log in `uepak.log` in the plugin
   folder. If that folder is not writable the log is kept in memory and copied to the
   clipboard whenever an operation fails. Re-read on every archive open, no restart needed.

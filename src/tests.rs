@@ -145,10 +145,8 @@ fn roundtrip_synthetic_paks() {
         let listed = list(&pak).unwrap();
         assert_eq!(listed.len(), files.len(), "{comp:?}");
         for (name, data) in &files {
-            let l = listed
-                .iter()
-                .find(|l| l.name == name.replace('/', "\\"))
-                .unwrap();
+            let shown = format!("TestGame\\Content\\{}", name.replace('/', "\\"));
+            let l = listed.iter().find(|l| l.name == shown).unwrap();
             assert_eq!(l.unpack, data.len() as u64);
             if comp.is_some() && !data.is_empty() && data.len() > 1000 {
                 assert!(
@@ -160,10 +158,8 @@ fn roundtrip_synthetic_paks() {
 
         let out = extract_all(&pak, &dir.join("out"));
         for (name, data) in &files {
-            let got = out
-                .iter()
-                .find(|(n, _)| *n == name.replace('/', "\\"))
-                .unwrap();
+            let shown = format!("TestGame\\Content\\{}", name.replace('/', "\\"));
+            let got = out.iter().find(|(n, _)| *n == shown).unwrap();
             assert_eq!(&got.1, data, "{comp:?} {name}");
         }
         let _ = std::fs::remove_dir_all(&dir);

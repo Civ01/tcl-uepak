@@ -97,12 +97,32 @@ No v13+ pak has been seen in the wild so far: games built with UE 5.8.4 still sh
 | None, Zlib, Gzip, Zstd, LZ4 | built in **[done]** |
 | Oodle | via `deps\oo2core_N_win64.dll`, any N, highest wins **[done]** |
 
-### 3.2 Listing **[done]**
+### 3.2 Listing **[done, view modes being revised]**
 
 - Entries are listed from the index; no file data is read until extraction.
-- Name shown = path relative to the mount point (`MountPoint=Root`), or prefixed with the
-  mount point minus leading `../` (`MountPoint=Folder`).
 - Directories are implied by paths (paks store no directory entries).
+
+#### View modes (`[Options] MountPoint`)
+
+A mount point is split into a hidden **base** (the leading `../`, `./` and `/` segments)
+and a **visible part** (the rest). Example: `../../../TheIsle/Content/` → base `../../../`,
+visible part `TheIsle/Content`.
+
+| Mode | Panel root shows | Use |
+|---|---|---|
+| `Folder` (**default**) | the visible part as folders: `TheIsle\Content\…` | see where files land in the game; extraction gives the same layout as `repak unpack` |
+| `Root` | the contents of the mount point: `Hiraeth\…`, `TheIsle\…` | work inside the mount point only |
+
+**Mount folders** (`Folder` mode only): every folder of the visible part is listed as an
+explicit directory entry with attributes `DIRECTORY | READONLY` (planned). They can be told
+apart with a TC colour rule on the `r` attribute for directories (Configuration → Colours →
+by file type). Names are never decorated (no `<…>`): the shown names travel back into
+extraction paths and `DeleteList`, and `<` `>` aren't valid in Windows file names.
+*To verify in TC: plugin-returned directory entries with READONLY take the colour.*
+
+**Mode consistency:** the plugin remembers, per archive path, which mode its last listing
+used, and maps `PackFiles` / `DeleteFiles` paths with that mode. Switching the mode in
+`uepak.ini` while a pak is open therefore can't make a delete hit the wrong paths.
 - Packed size and unpacked size come from the index; >4 GB entries are supported.
 - File date/time: the `.pak` file's own modification time (modern paks store none).
 - Entries are skipped, and logged, if they contain `..`, are absolute, contain `:`, or have
@@ -130,10 +150,12 @@ extracts each candidate through `ProcessFile`, so this needs no extra code.
 
 **Lookup order:**
 
-1. A key remembered for the pak's **folder** (exact full path, case-insensitive) and the
-   pak's key GUID.
-2. If the key GUID is non-zero: any remembered key with the same GUID, tried silently.
-   A successful match is remembered for this folder too.
+1. A key remembered for the pak's **folder or any parent folder** (full paths,
+   case-insensitive; the deepest match wins) with the pak's key GUID. A key saved for
+   `…\Content\Paks` also covers `…\Paks\~mods` and `…\Paks\LogicMods`.
+2. If the key GUID is non-zero: any remembered key with the same GUID, from any folder,
+   tried silently. A successful match is remembered for this folder too.
+   (A zero GUID identifies nothing: every game's main key has it.)
 3. Otherwise, show the key dialog.
 
 A key is valid if it decrypts the index (or entry) into something that parses. A wrong key
@@ -181,10 +203,14 @@ re-opens the dialog with "Key does not match this pak".
 | TC action | Plugin call | Result |
 |---|---|---|
 | Alt+F5, choose `pak`, new name | `PackFilesW` on a non-existing file | new pak with the current pack settings (§5) |
-| Alt+F5 onto an existing `.pak` | `PackFilesW` on an existing file | add/replace entries (§4.4) |
+| Alt+F5 with the name of an existing `.pak` typed in | `PackFilesW` on an existing file | add/replace entries (§4.4), always at the pak's root (`SubPath` is never set) |
 | F5 from a panel into an open pak | `PackFilesW` on an existing file | same as above |
 | F8 inside an open pak | `DeleteFilesW` | remove entries (§4.5) |
 | "Configure" button in the Alt+F5 dialog | `ConfigurePacker` | settings dialog (§5) |
+
+Alt+F5 does **not** target a pak that is open in the other panel: TC proposes a new name
+built from the source folder (`<target dir>\<source folder>.pak`). To add to an open pak,
+use F5 into it.
 
 TC passes no per-operation settings to `PackFiles`. "Settings for this operation" means
 the last values saved in the dialog. They persist and apply to every pack until changed.
@@ -195,16 +221,18 @@ The dialog is the same one reached from TC's plugin configuration.
 The same model as repak: **the mount point places the files and pak paths are relative to the
 selected items.**
 
-- Pak entry path = `SubPath\` (if TC supplies one) + the AddList item, with `\` converted to
-  `/`. Paths are relative to `SrcPath`, the folder whose contents are being packed.
+- Target path = `SubPath\` (if TC supplies one) + the AddList item, in the panel's view
+  (§3.2). Converted to a pak entry path as described in §4.2.1. Paths are relative to
+  `SrcPath`, the folder whose contents are being packed.
 - Example: mount point `../../../Townfall/Config`, source panel inside the folder that
   contains `Engine.ini`, select `Engine.ini` → entry `Engine.ini`. The game sees it as
   `Townfall/Config/Engine.ini`.
 - No extra path prefix setting.
 - AddList items ending in `\` (folders) produce no entry; their files are listed by TC
   individually. Empty folders cannot be represented in a pak and are dropped (logged).
-- `PK_PACK_SAVE_PATHS` not set → entries use the file name only. Two files with the same
-  name → abort before writing, with the duplicates named in the message.
+- `PK_PACK_SAVE_PATHS` not set → entries use the file name only. TC still sends the full
+  relative paths (`deps\oo2core_9_win64.dll`); the plugin strips them. Two files with the
+  same name → abort before writing, with the duplicates named in the message.
 - `PK_PACK_MOVE_FILES` → delete the source files only after the whole pak is written and
   closed successfully.
 - `PK_PACK_ENCRYPT` is never offered (no `PK_CAPS_ENCRYPT`).
@@ -212,6 +240,37 @@ selected items.**
 - Mount point normalisation: `\` → `/`, a trailing `/` is added, and an empty value becomes
   `../../../`. The value is otherwise written as typed, so `/Game/` style mount points are
   possible.
+
+#### 4.2.1 Existing paks: view path → entry path
+
+New paks are unaffected by the view mode (there is nothing to view yet). For F5 into an
+open pak and for F8:
+
+**`Root` mode.** Every view path is relative to the mount point. Entry path = view path.
+No guards: you can only work inside the mount point.
+
+**`Folder` mode.** Let *V* be the mount point's visible part (`TheIsle\Content`).
+
+- Target **inside** *V* (equal to *V* or below it): entry path = target minus `V\`.
+  The mount point is unchanged. This is the normal case.
+- Target **outside** *V*: at the panel root, in a mount folder above the deepest one
+  (`TheIsle`), or beside one (`TheIsle\Plugins`). The new visible part becomes the
+  deepest common folder of *V* and all targets (`TheIsle`, or empty at the root). Before
+  writing, ask:
+
+  > These files go outside the pak's mount point `../../../TheIsle/Content/`.
+  > The mount point will change to `../../../TheIsle/`. Files already in the pak keep
+  > their game paths (`TheIsle/Content/...`); only the pak's index is rewritten, no file
+  > data is repacked. Continue?
+
+  Yes → re-root every existing entry (prefix it with the dropped segments, e.g. `Content/`),
+  then add the new files. No → `E_EABORTED`, nothing written.
+- Why this is cheap: entry paths exist only in the index. The per-entry record stored
+  before each file's data has no name, so changing the mount point is an index rewrite
+  (same transactional procedure as §4.4), not a repack.
+- The hidden base (`../../../`) never changes, so nothing can be packed above it.
+- Comparisons are case-insensitive. The new mount point keeps the original's spelling for
+  the segments it keeps.
 
 ### 4.3 New paks
 
@@ -261,10 +320,13 @@ index and footer are written. Replaced data stays in the file as dead space.
 
 ### 4.5 Deleting
 
-- `DeleteList` items are entry paths as TC shows them, in the same form as the listing,
-  including the `MountPoint=Folder` prefix if that mode is active.
-- `dir\*.*` (how TC passes a folder) deletes everything under `dir/` recursively. *To verify
-  against TC's actual behaviour during implementation.*
+- `DeleteList` items are view paths, exactly as listed (verified in TC 11 x64):
+  - files: `Shaders\StandaloneRenderer\OpenGL\SplashVertexShader.glsl` (`Root`) or
+    `Engine\Shaders\…\SplashVertexShader.glsl` (`Folder`);
+  - a folder: `Engine\Shaders\StandaloneRenderer\OpenGL\*.*` → everything below it,
+    recursively.
+- Paths map to entries as in §4.2.1. Deleting never changes the mount point. Deleting a
+  mount folder (`Folder` mode) deletes every entry below it.
 - Only the index is rewritten (same transactional procedure as §4.4); data becomes dead
   space.
 - Deleting every entry leaves a valid, empty pak.
@@ -310,7 +372,7 @@ units.
 │   ⚠ (warning line for Zstd/LZ4/large blocks/missing Oodle DLL)
 │                                                       │
 │ Browsing                                              │
-│   Mount point     (•) as root  ( ) as folders         │
+│   Mount point     (•) as folders  ( ) as root         │
 │   [ ] Debug log (uepak.log)                           │
 │                                                       │
 │ [Defaults]                          [ OK ] [ Cancel ] │
@@ -335,8 +397,8 @@ units.
 
 ```ini
 [Options]
-; Browsing: Root = contents relative to the mount point, Folder = mount point as folders
-MountPoint=Root
+; Browsing: Folder = mount point shown as folders (default), Root = contents of the mount point
+MountPoint=Folder
 ; 1 = write uepak.log (see SPEC §7)
 DebugLog=0
 
@@ -456,14 +518,31 @@ folder).
 
 ---
 
-## 11. Open items
+## 11. Observed TC behaviour (TC 11 x64, captured with the logging stubs)
 
-1. **Background operations** (§8.1): worth enabling once packing is stable?
-2. **Key fallback by GUID** (§3.5 step 2): keep, or folder-only?
-3. **TC `PackFiles` / `DeleteFiles` argument formats:** capture with the logging stubs
-   (current build: the calls are recorded and refused) for: F8 on files, F8 on a folder,
-   F5 from a panel into an open pak (root and subfolder), Alt+F5 with and without
-   "pack path names" and "move to archive".
+| Action | What TC passes |
+|---|---|
+| F8 on files | `DeleteList` = view paths, one per file |
+| F8 on a folder | `DeleteList` = `folder\*.*` |
+| F5 into an open pak, at its root | `SubPath` = none |
+| F5 into an open pak, in a subfolder | `SubPath` = that view path (`Engine\Programs\CrashReportClient`) |
+| Any pack, a folder selected | `AddList` = folder entry with trailing `\` (`deps\`), then each file with its relative path |
+| "Also pack path names" off | `Flags` = 0, but `AddList` still has relative paths |
+| "Move to archive" | `Flags` includes 1 (`MOVE_FILES`) |
+| Alt+F5 with a pak open in the other panel | new file name `<dir>\<source folder>.pak`, `SubPath` none (the open pak isn't targeted) |
+| After any `PackFiles` | TC re-opens the pak in list mode to refresh the panel |
+| Configure | `Parent` = TC window handle, `DllInstance` = the plugin's module |
 
-Resolved: compact = checkbox (§4.4); `pluginst.inf` with `file=uepak.wcx64` installs in
-TC 11 x64.
+## 12. Open items
+
+1. **Mount folder colouring** (§3.2): verify that TC colours plugin-returned READONLY
+   directory entries, and that extraction ignores the attribute.
+
+Resolved:
+- Compact = checkbox (§4.4).
+- `pluginst.inf` with `file=uepak.wcx64` installs in TC 11 x64.
+- Key lookup = folder or parent folder, then same non-zero GUID (§3.5).
+- View modes: both supported, `Folder` is the default, mount-point guard in `Folder`
+  mode (§3.2, §4.2.1).
+- TC argument formats captured (§11).
+- Background operations: after packing is stable (§8.1).

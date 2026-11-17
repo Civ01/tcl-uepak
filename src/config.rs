@@ -14,9 +14,9 @@ pub const DEPS_DIR: &str = "deps";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MountPointMode {
     /// Paths are shown relative to the mount point (mount point is the root).
-    #[default]
     Root,
     /// The mount point (minus leading `../`) is shown as top-level folders.
+    #[default]
     Folder,
 }
 
@@ -112,8 +112,8 @@ pub fn parse_options(text: &str) -> Options {
         match key.as_str() {
             "mountpoint" => {
                 opts.mount_point = match value.as_str() {
-                    "folder" | "1" => MountPointMode::Folder,
-                    _ => MountPointMode::Root,
+                    "root" | "0" => MountPointMode::Root,
+                    _ => MountPointMode::Folder,
                 }
             }
             "debuglog" => opts.debug_log = matches!(value.as_str(), "1" | "true" | "yes" | "on"),
@@ -131,9 +131,9 @@ mod tests {
     fn parses_mount_point() {
         let o = parse_options("[Options]\nMountPoint = Folder\n");
         assert_eq!(o.mount_point, MountPointMode::Folder);
-        let o = parse_options("; c\n[other]\nMountPoint=Folder\n[options]\nmountpoint=root");
+        let o = parse_options("; c\n[other]\nMountPoint=Root\n[options]\nmountpoint=root");
         assert_eq!(o.mount_point, MountPointMode::Root);
-        assert_eq!(parse_options("").mount_point, MountPointMode::Root);
+        assert_eq!(parse_options("").mount_point, MountPointMode::Folder);
     }
 
     #[test]
