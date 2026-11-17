@@ -25,6 +25,118 @@ pub const ATTR_READONLY: u32 = 0x1;
 pub const ATTR_HIDDEN: u32 = 0x2;
 pub const ATTR_SYSTEM: u32 = 0x4;
 
+/// Compression for new entries (`[Pack] Compression`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackCompression {
+    None,
+    Zlib,
+    Gzip,
+    Oodle,
+    Zstd,
+    Lz4,
+}
+
+impl PackCompression {
+    pub fn parse(v: &str) -> Option<Self> {
+        Some(match v.trim().to_ascii_lowercase().as_str() {
+            "" | "none" | "store" => Self::None,
+            "zlib" => Self::Zlib,
+            "gzip" => Self::Gzip,
+            "oodle" => Self::Oodle,
+            "zstd" => Self::Zstd,
+            "lz4" => Self::Lz4,
+            _ => return None,
+        })
+    }
+
+    pub fn repak(self) -> Option<repak::Compression> {
+        Some(match self {
+            Self::None => return None,
+            Self::Zlib => repak::Compression::Zlib,
+            Self::Gzip => repak::Compression::Gzip,
+            Self::Oodle => repak::Compression::Oodle,
+            Self::Zstd => repak::Compression::Zstd,
+            Self::Lz4 => repak::Compression::LZ4,
+        })
+    }
+}
+
+/// `[Pack]` section: settings for new paks (the Configure dialog will edit these).
+#[derive(Debug, Clone)]
+pub struct PackOptions {
+    pub mount_point: String,
+    pub version: repak::Version,
+    pub compression: PackCompression,
+    /// Uncompressed bytes per compression block.
+    pub block_size: u32,
+}
+
+pub const DEFAULT_PACK_MOUNT: &str = "../../../";
+pub const DEFAULT_BLOCK_SIZE: u32 = 65536;
+
+impl Default for PackOptions {
+    fn default() -> Self {
+        PackOptions {
+            mount_point: DEFAULT_PACK_MOUNT.into(),
+            version: repak::Version::V11,
+            compression: PackCompression::None,
+            block_size: DEFAULT_BLOCK_SIZE,
+        }
+    }
+}
+
+/// `V11`, `v11`, `11`, `V8B`, `8b` -> version (V1 and V6 are not writable).
+pub fn parse_version(v: &str) -> Option<repak::Version> {
+    use repak::Version::*;
+    let v = v.trim().to_ascii_uppercase();
+    let v = v.strip_prefix('V').unwrap_or(&v);
+    Some(match v {
+        "2" => V2,
+        "3" => V3,
+        "4" => V4,
+        "5" => V5,
+        "7" => V7,
+        "8A" => V8A,
+        "8B" | "8" => V8B,
+        "9" => V9,
+        "10" => V10,
+        "11" => V11,
+        "12" => V12,
+        _ => return None,
+    })
+}
+
+/// `65536`, `64K`, `64KB`, `1M` -> bytes (at least 1 KB, at most 64 MB).
+pub fn parse_size(v: &str) -> Option<u32> {
+    let v = v.trim().to_ascii_uppercase();
+    let v = v.strip_suffix('B').unwrap_or(&v);
+    let (num, mul) = if let Some(n) = v.strip_suffix('K') {
+        (n, 1024)
+    } else if let Some(n) = v.strip_suffix('M') {
+        (n, 1024 * 1024)
+    } else {
+        (v, 1)
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    let bytes = n.checked_mul(mul)?;
+    (1024..=64 * 1024 * 1024)
+        .contains(&bytes)
+        .then_some(bytes as u32)
+}
+
+/// Normalises a mount point: `\` -> `/`, trailing `/`, empty -> `../../../`.
+pub fn normalize_mount(v: &str) -> String {
+    let v = v.trim().replace('\\', "/");
+    if v.is_empty() {
+        return DEFAULT_PACK_MOUNT.into();
+    }
+    if v.ends_with('/') {
+        v
+    } else {
+        format!("{v}/")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub mount_point: MountPointMode,
@@ -34,6 +146,9 @@ pub struct Options {
     pub mount_folder_attr: u32,
     /// `DebugLog=1`: write a diagnostic log (see `log.rs`).
     pub debug_log: bool,
+    pub pack: PackOptions,
+    /// Problems found while parsing (logged; invalid values keep defaults).
+    pub warnings: Vec<String>,
 }
 
 impl Default for Options {
@@ -42,6 +157,8 @@ impl Default for Options {
             mount_point: MountPointMode::default(),
             mount_folder_attr: ATTR_READONLY,
             debug_log: false,
+            pack: PackOptions::default(),
+            warnings: vec![],
         }
     }
 }
@@ -134,6 +251,31 @@ pub fn parse_options(text: &str) -> Options {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
+        if section == "pack" {
+            let key = key.trim().to_ascii_lowercase().replace('_', "");
+            let raw = value.trim();
+            let mut bad = || {
+                opts.warnings
+                    .push(format!("[Pack] {key}={raw}: invalid, default kept"))
+            };
+            match key.as_str() {
+                "mountpoint" => opts.pack.mount_point = normalize_mount(raw),
+                "version" => match parse_version(raw) {
+                    Some(v) => opts.pack.version = v,
+                    None => bad(),
+                },
+                "compression" => match PackCompression::parse(raw) {
+                    Some(c) => opts.pack.compression = c,
+                    None => bad(),
+                },
+                "blocksize" => match parse_size(raw) {
+                    Some(b) => opts.pack.block_size = b,
+                    None => bad(),
+                },
+                _ => {}
+            }
+            continue;
+        }
         if section != "options" {
             continue;
         }
@@ -179,6 +321,31 @@ mod tests {
             parse_options("[Options]\nMountFolderAttr=None").mount_folder_attr,
             0
         );
+    }
+
+    #[test]
+    fn parses_pack_section() {
+        let o = parse_options(
+            "[Pack]\nMountPoint=..\\..\\..\\Townfall\\Config\nVersion=v12\nCompression=Oodle\nBlockSize=128K",
+        );
+        assert_eq!(o.pack.mount_point, "../../../Townfall/Config/");
+        assert_eq!(o.pack.version, repak::Version::V12);
+        assert_eq!(o.pack.compression, PackCompression::Oodle);
+        assert_eq!(o.pack.block_size, 131072);
+        let d = parse_options("");
+        assert_eq!(d.pack.mount_point, "../../../");
+        assert_eq!(d.pack.version, repak::Version::V11);
+        assert_eq!(d.pack.compression, PackCompression::None);
+        assert_eq!(d.pack.block_size, 65536);
+        let bad = parse_options("[Pack]\nVersion=V99\nCompression=brotli\nBlockSize=1");
+        assert_eq!(bad.pack.version, repak::Version::V11);
+        assert_eq!(bad.warnings.len(), 3);
+        assert_eq!(
+            parse_options("[Pack]\nMountPoint=").pack.mount_point,
+            "../../../"
+        );
+        assert_eq!(parse_version("8a"), Some(repak::Version::V8A));
+        assert_eq!(parse_size("1M"), Some(1 << 20));
     }
 
     #[test]

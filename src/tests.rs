@@ -188,25 +188,13 @@ fn rejects_non_pak() {
 }
 
 #[test]
-fn pack_and_delete_stubs_record_and_refuse() {
+fn delete_stub_records_and_refuses() {
     let pak = wide("C:\\x\\new.pak");
-    let src = wide("C:\\src\\");
-    // "a.txt\0dir\\b.txt\0\0"
     let list: Vec<u16> = "a.txt\0dir\\b.txt\0\0".encode_utf16().collect();
     assert_eq!(
         unsafe { win::from_wide_multi(list.as_ptr()) },
         vec!["a.txt", "dir\\b.txt"]
     );
-    let r = unsafe {
-        PackFilesW(
-            pak.as_ptr(),
-            std::ptr::null(),
-            src.as_ptr(),
-            list.as_ptr(),
-            2,
-        )
-    };
-    assert_eq!(r, E_NOT_SUPPORTED);
     assert_eq!(
         unsafe { DeleteFilesW(pak.as_ptr(), list.as_ptr()) },
         E_NOT_SUPPORTED
@@ -541,4 +529,241 @@ fn root_mount_point_has_no_mount_folders() {
     w.write_file("a.txt", false, b"x").unwrap();
     w.write_index().unwrap();
     assert_eq!(list_all(&pak2).unwrap().len(), 1, "nothing visible to show");
+}
+
+// ---------------------------------------------------------------------------
+// Packing
+
+/// Source tree: a.txt, deps\\big.bin (compressible), deps\\noise.bin
+/// (incompressible), deps\\sub\\empty.txt (0 bytes), empty\\ (empty folder).
+type Source = (PathBuf, Vec<String>, Vec<(String, Vec<u8>)>);
+
+fn make_source(name: &str) -> Source {
+    let root = tmp(name).join("src");
+    let mut x: u64 = 0x2545F4914F6CDD1D;
+    let noise: Vec<u8> = (0..100_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 32) as u8
+        })
+        .collect();
+    let files = vec![
+        ("a.txt".to_string(), b"hello pak".to_vec()),
+        (
+            "deps/big.bin".to_string(),
+            b"0123456789abcdef".repeat(20_000),
+        ),
+        ("deps/noise.bin".to_string(), noise),
+        ("deps/sub/empty.txt".to_string(), vec![]),
+    ];
+    for (rel, data) in &files {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, data).unwrap();
+    }
+    std::fs::create_dir_all(root.join("empty")).unwrap();
+    // TC's AddList: folders with trailing backslash, then their files
+    let add = [
+        "a.txt",
+        "deps\\",
+        "deps\\big.bin",
+        "deps\\noise.bin",
+        "deps\\sub\\",
+        "deps\\sub\\empty.txt",
+        "empty\\",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    (root, add, files)
+}
+
+fn read_back(pak: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut f = std::io::BufReader::new(std::fs::File::open(pak).unwrap());
+    let r = repak::PakBuilder::new().reader(&mut f).unwrap();
+    let mut out: Vec<_> = r
+        .files()
+        .into_iter()
+        .map(|p| {
+            let d = r.get(&p, &mut f).unwrap();
+            (p, d)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn pack_new_pak_every_compression() {
+    use crate::config::{PackCompression, PackOptions};
+    let (src, add, files) = make_source("pack-all");
+    let mut expected = files.clone();
+    expected.sort();
+    for comp in [
+        PackCompression::None,
+        PackCompression::Zlib,
+        PackCompression::Gzip,
+        PackCompression::Zstd,
+        PackCompression::Lz4,
+    ] {
+        let opts = PackOptions {
+            compression: comp,
+            ..PackOptions::default()
+        };
+        let pak = src.parent().unwrap().join(format!("{comp:?}.pak"));
+        let r = crate::pack_files(&pak, None, &src, &add, pack::PK_PACK_SAVE_PATHS, &opts);
+        assert_eq!(r, 0, "{comp:?}");
+        assert!(!pak
+            .with_file_name(format!("{comp:?}.pak.uepak-tmp"))
+            .exists());
+        assert_eq!(read_back(&pak), expected, "{comp:?} round trip");
+        if let Ok(dir) = std::env::var("UEPAK_KEEP_PACKED") {
+            std::fs::copy(&pak, Path::new(&dir).join(pak.file_name().unwrap())).unwrap();
+        }
+        // through the plugin's own reader too
+        let listed = list(&pak).unwrap();
+        assert_eq!(listed.len(), files.len());
+        let mut f = std::io::BufReader::new(std::fs::File::open(&pak).unwrap());
+        let r = repak::PakBuilder::new().reader(&mut f).unwrap();
+        assert_eq!(r.version(), repak::Version::V11);
+        assert_eq!(r.mount_point(), "../../../");
+        let big = r.entry("deps/big.bin").unwrap();
+        let noise = r.entry("deps/noise.bin").unwrap();
+        if comp == PackCompression::None {
+            assert_eq!(big.compression, None);
+        } else {
+            assert!(big.compression.is_some(), "{comp:?} big.bin compressed");
+            assert!(big.compressed_size < big.uncompressed_size / 4);
+            assert_eq!(noise.compression, None, "{comp:?} noise stored raw");
+        }
+    }
+}
+
+#[test]
+fn pack_through_tc_export_with_defaults() {
+    let (src, _add, _files) = make_source("pack-ffi");
+    let pak = src.parent().unwrap().join("ffi.pak");
+    let pak_w = wide(&pak.to_string_lossy());
+    // TC sends SrcPath with a trailing separator
+    let src_w = wide(&format!("{}{}", src.display(), std::path::MAIN_SEPARATOR));
+    let list: Vec<u16> = "a.txt\0deps\\\0deps\\big.bin\0\0".encode_utf16().collect();
+    let r = unsafe {
+        PackFilesW(
+            pak_w.as_ptr(),
+            std::ptr::null(),
+            src_w.as_ptr(),
+            list.as_ptr(),
+            2,
+        )
+    };
+    assert_eq!(r, 0);
+    let names: Vec<_> = read_back(&pak).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["a.txt", "deps/big.bin"]);
+    // existing pak: not implemented yet, refused, untouched
+    let before = std::fs::read(&pak).unwrap();
+    let r = unsafe {
+        PackFilesW(
+            pak_w.as_ptr(),
+            std::ptr::null(),
+            src_w.as_ptr(),
+            list.as_ptr(),
+            2,
+        )
+    };
+    assert_eq!(r, E_NOT_SUPPORTED);
+    assert_eq!(std::fs::read(&pak).unwrap(), before);
+}
+
+#[test]
+fn pack_mount_point_flatten_and_move() {
+    use crate::config::PackOptions;
+    let (src, add, _files) = make_source("pack-move");
+    let opts = PackOptions {
+        mount_point: "../../../Townfall/Config/".into(),
+        version: repak::Version::V12,
+        ..PackOptions::default()
+    };
+    // flattening collides? a.txt, big.bin, noise.bin, empty.txt: no collision
+    let pak = src.parent().unwrap().join("move.pak");
+    let r = crate::pack_files(&pak, None, &src, &add, pack::PK_PACK_MOVE_FILES, &opts);
+    assert_eq!(r, 0);
+    let names: Vec<_> = read_back(&pak).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["a.txt", "big.bin", "empty.txt", "noise.bin"]);
+    assert!(!src.join("a.txt").exists(), "moved");
+    assert!(!src.join("deps").exists(), "emptied folders removed");
+    assert!(archive::sniff_footer(&pak).unwrap().version == 12);
+    let all = list_all(&pak).unwrap();
+    assert!(all.iter().any(|l| l.name == "Townfall\\Config\\a.txt"));
+}
+
+#[test]
+fn pack_refusals_leave_nothing_behind() {
+    use crate::config::{PackCompression, PackOptions};
+    let (src, add, _files) = make_source("pack-refuse");
+    let dir = src.parent().unwrap().to_path_buf();
+    // LZ4 needs v8+
+    let opts = PackOptions {
+        compression: PackCompression::Lz4,
+        version: repak::Version::V7,
+        ..PackOptions::default()
+    };
+    let pak = dir.join("v7.pak");
+    assert_eq!(
+        crate::pack_files(&pak, None, &src, &add, 2, &opts),
+        E_NOT_SUPPORTED
+    );
+    assert!(!pak.exists());
+    // Oodle without the library
+    if oodle_loader::oodle().is_err() {
+        let opts = PackOptions {
+            compression: PackCompression::Oodle,
+            ..PackOptions::default()
+        };
+        let pak = dir.join("oodle.pak");
+        assert_eq!(
+            crate::pack_files(&pak, None, &src, &add, 2, &opts),
+            E_NOT_SUPPORTED
+        );
+        assert!(!pak.exists());
+    }
+    // name collision when flattening
+    std::fs::write(src.join("deps").join("a.txt"), b"other").unwrap();
+    let mut add2 = add.clone();
+    add2.push("deps\\a.txt".into());
+    let pak = dir.join("dup.pak");
+    assert_eq!(
+        crate::pack_files(&pak, None, &src, &add2, 0, &PackOptions::default()),
+        E_EABORTED
+    );
+    assert!(!pak.exists());
+    // unreadable source
+    let mut add3 = add.clone();
+    add3.push("missing.bin".into());
+    let pak = dir.join("missing.pak");
+    assert_eq!(
+        crate::pack_files(&pak, None, &src, &add3, 2, &PackOptions::default()),
+        E_EABORTED
+    );
+    assert!(!pak.exists());
+    assert!(!dir.join("missing.pak.uepak-tmp").exists());
+}
+
+unsafe extern "system" fn cancel_cb(_name: *mut u16, _size: i32) -> i32 {
+    0
+}
+
+#[test]
+fn pack_cancel_removes_partial_pak() {
+    use crate::config::PackOptions;
+    let (src, add, _files) = make_source("pack-cancel");
+    let pak = src.parent().unwrap().join("cancel.pak");
+    SetProcessDataProcW(std::ptr::null_mut(), Some(cancel_cb));
+    let r = crate::pack_files(&pak, None, &src, &add, 2, &PackOptions::default());
+    SetProcessDataProcW(std::ptr::null_mut(), None);
+    assert_eq!(r, E_EABORTED);
+    assert!(!pak.exists());
+    assert!(!pak.with_file_name("cancel.pak.uepak-tmp").exists());
+    assert!(src.join("a.txt").exists(), "sources untouched");
 }

@@ -3,8 +3,11 @@
 Total Commander 11+ packer plugin (WCX, **x64 only**) for Unreal Engine `.pak` files.
 Built in Rust on a fork of [repak](https://github.com/Civ01/repak).
 
-Status: **reading** — list, extract (F5), test, AES-encrypted paks (key prompt, remembered
-keys). Packing: calls are recorded but not implemented yet (see SPEC.md).
+Status:
+- **Reading:** list, extract (F5), test, AES-encrypted paks (key prompt, remembered keys).
+- **Packing:** new paks via Alt+F5 with no compression, Zlib, Gzip, Oodle, Zstd or LZ4
+  (settings in `uepak.ini` `[Pack]`). Adding to / deleting from existing paks and the
+  settings dialog are next (see SPEC.md).
 
 ## Install
 

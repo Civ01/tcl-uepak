@@ -77,7 +77,7 @@ pub fn mount_prefix(mount_point: &str) -> String {
 }
 
 /// Rejects entry names that would escape the destination folder.
-fn is_safe_relative(path: &str) -> bool {
+pub fn is_safe_relative(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with(['/', '\\'])
         && !path.contains(':')

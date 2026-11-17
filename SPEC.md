@@ -61,7 +61,7 @@ the plugin folder if it is writable, otherwise the folder of `wincmd.ini` (from
 | `CanYouHandleThisFileW` | read | done (footer magic in the last 512 bytes) |
 | `PackSetDefaultParams` | both | done |
 | `GetPackerCaps` | both | done; packing caps added with §4 |
-| `PackFilesW` | pack | planned |
+| `PackFilesW` | pack | new paks done; adding to existing paks planned |
 | `DeleteFilesW` | pack | planned |
 | `ConfigurePacker` | pack | planned (settings dialog, §5) |
 | `GetBackgroundFlags` | both | planned, see §8 |
@@ -290,7 +290,7 @@ No guards: you can only work inside the mount point.
 - Comparisons are case-insensitive. The new mount point keeps the original's spelling for
   the segments it keeps.
 
-### 4.3 New paks
+### 4.3 New paks **[done: basic]**
 
 Written with the dialog's version, mount point, compression method, level, Oodle compressor
 and block size.
@@ -298,7 +298,11 @@ and block size.
 - **Per-entry fallback:** if compressing an entry doesn't make it smaller, store it
   uncompressed (UnrealPak behaviour). Stops small or already-compressed files from growing.
 - Files are streamed from disk block by block. Memory use stays flat for multi-GB inputs
-  (fork change F5).
+  (fork change F5). *Current build: each file is read into memory whole.*
+- Written to `<pak>.uepak-tmp` and renamed into place at the end, so a failed or cancelled
+  pack never leaves a partial pak.
+- Verified: the primary index, path-hash index and full-directory index SHA-1s match, as
+  in real UE paks (UE checks them on mount).
 - Progress through `ProcessDataProcW` (bytes read from the source); cancel → delete the
   partial pak, `E_EABORTED`.
 - Any failure → delete the partial pak, then return the matching code (`E_EREAD`,
@@ -498,7 +502,7 @@ background-safe path. Tracked as an open item.
 | F1 | ✅ Oodle search paths, optional download, no unwrap | Oodle via `deps\` |
 | F2 | ✅ `entries()` / `EntryInfo` | listing |
 | F3 | ✅ v12, `UnsupportedVersion`, clear `Encrypted` error | reading |
-| F4 | Compression settings: level per method, Oodle compressor + level, block size, uncompressed fallback when not smaller | §4.3, §4.6, §4.7 |
+| F4 | Compression settings: ✅ block size, ✅ uncompressed fallback when not smaller; level per method, Oodle compressor + level still to do | §4.3, §4.6, §4.7 |
 | F5 | Streaming writes from a `Read` (block by block) with a progress / cancel callback | large files, progress |
 | F6 | `PakWriter::remove(path)`; adding a compression method to an existing pak's footer slots; expose original `index_offset` for the undo tail; copy an entry's stored bytes into another pak without recompressing (compact) | §4.4, §4.5 |
 | F7 | Block-by-block decompression on read (constant memory), with progress | §3.3 |
