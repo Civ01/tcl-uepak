@@ -49,10 +49,11 @@ deps\            third-party codec DLLs, e.g. oo2core_9_win64.dll for Oodle
 ## AES keys
 
 Opening a pak with an encrypted file list asks for its key (64 hex digits, optional `0x`, or
-base64). A wrong key is detected and the dialog asks again. With "Remember" ticked the key
-is stored in `uepak.keys.json` (settings folder) for that folder and its subfolders; a key
-for a non-zero key GUID is also tried for paks with the same GUID elsewhere. Keys are never
-written to the log.
+base64). A wrong key is detected and the dialog asks again. The key is saved in
+`uepak.keys.json` (settings folder) for that folder and its subfolders, unless you tick
+"Use for this session only": then it's kept only until TC exits. A key with a non-zero key
+GUID is also tried, without saving it again, for paks with the same GUID elsewhere. Keys are
+never written to the log.
 
 ## Options (`uepak.ini`)
 

@@ -98,7 +98,9 @@ pub(crate) fn open_with_keys(path: &Path, options: &config::Options) -> Result<A
             Ok(arc) => {
                 dlog!("  key from {source:?} record ({from}) matches");
                 if source == keys::Source::Guid {
-                    save_key(&folder, &guid, &key, true);
+                    // session only: the next lookup finds the saved record by
+                    // its GUID anyway, so the keys file isn't touched
+                    save_key(&folder, &guid, &key, false);
                 }
                 return Ok(arc);
             }

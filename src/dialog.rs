@@ -71,7 +71,7 @@ mod imp {
 
     const ID_INFO: u16 = 100;
     const ID_EDIT: u16 = 101;
-    const ID_REMEMBER: u16 = 102;
+    const ID_SESSION: u16 = 102;
     const ID_ERROR: u16 = 103;
     const ID_LABEL: u16 = 104;
     const BM_GETCHECK: u32 = 0x00F0;
@@ -221,8 +221,8 @@ mod imp {
             74,
             296,
             10,
-            ID_REMEMBER,
-            "&Remember for this folder and its subfolders",
+            ID_SESSION,
+            "Use for this &session only (don't save it to uepak.keys.json)",
         );
         t.item(STATIC, SS_NOPREFIX, 7, 88, 296, 18, ID_ERROR, "");
         t.item(
@@ -246,7 +246,6 @@ mod imp {
                 let st = &*(lp as *const State);
                 SetDlgItemTextW(hwnd, ID_INFO as i32, st.info.as_ptr());
                 SetDlgItemTextW(hwnd, ID_ERROR as i32, st.error.as_ptr());
-                SendDlgItemMessageW(hwnd, ID_REMEMBER as i32, BM_SETCHECK, 1, 0);
                 SendDlgItemMessageW(hwnd, ID_EDIT as i32, EM_LIMITTEXT, 200, 0);
                 1 // focus goes to the first tab stop: the edit box
             }
@@ -257,8 +256,9 @@ mod imp {
                     let mut buf = [0u16; 256];
                     let n =
                         GetDlgItemTextW(hwnd, ID_EDIT as i32, buf.as_mut_ptr(), buf.len() as i32);
+                    // unticked (default): saved for this folder and its subfolders
                     let remember =
-                        SendDlgItemMessageW(hwnd, ID_REMEMBER as i32, BM_GETCHECK, 0, 0) == 1;
+                        SendDlgItemMessageW(hwnd, ID_SESSION as i32, BM_GETCHECK, 0, 0) != 1;
                     (*st).answer = Some(KeyAnswer {
                         text: String::from_utf16_lossy(&buf[..n as usize]),
                         remember,

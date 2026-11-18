@@ -1890,3 +1890,37 @@ fn parallel_key_saves_are_not_lost() {
     let _ = std::fs::remove_file(keys_file());
     crate::keys::clear_session();
 }
+
+/// A key found through the pak's non-zero GUID (saved for another folder) is
+/// used silently and kept for the session, without writing the keys file:
+/// the saved GUID record finds it next time anyway.
+#[test]
+fn guid_match_is_used_without_saving_again() {
+    let _g = KEY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::keys::clear_session();
+    crate::dialog::TEST_ANSWERS.lock().unwrap().clear();
+    let _ = std::fs::remove_file(keys_file());
+    let pak = copy_to_tmp("guid-session", &testdata("enc_index.pak"));
+    let mut bytes = std::fs::read(&pak).unwrap();
+    let magic = archive::PAK_MAGIC.to_le_bytes();
+    let pos = bytes.windows(4).rposition(|w| w == magic).unwrap();
+    bytes[pos - 17..pos - 1].copy_from_slice(&[0xCD; 16]);
+    std::fs::write(&pak, &bytes).unwrap();
+    let guid = archive::sniff_footer(&pak).unwrap().key_guid.unwrap();
+    // saved for another game folder
+    let other = tmp("guid-session-other");
+    crate::keys::remember(&other, &guid, &test_key(), true).unwrap();
+    let saved = std::fs::read(keys_file()).unwrap();
+    crate::keys::clear_session();
+    // no prompt queued: the GUID record must be enough
+    assert_eq!(list(&pak).unwrap().len(), 4);
+    assert_eq!(
+        std::fs::read(keys_file()).unwrap(),
+        saved,
+        "keys file untouched"
+    );
+    // and the second open in this session doesn't even need the file
+    let _ = std::fs::remove_file(keys_file());
+    assert_eq!(list(&pak).unwrap().len(), 4);
+    crate::keys::clear_session();
+}

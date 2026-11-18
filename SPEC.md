@@ -214,8 +214,10 @@ extracted is encrypted (asked on first such extraction).
 1. A remembered key for the pak's **folder or any parent folder** (case-insensitive, deepest
    match first) with the pak's key GUID. A key for `…\Content\Paks` also covers
    `…\Paks\~mods`.
-2. For a non-zero key GUID: any remembered key with that GUID, from any folder; a match is
-   saved for this folder too. (A zero GUID identifies nothing: every game's main key has it.)
+2. For a non-zero key GUID: any remembered key with that GUID, from any folder, tried
+   silently. A match is kept for this session only; `uepak.keys.json` isn't changed (the
+   saved GUID record finds it again next time). (A zero GUID identifies nothing: every
+   game's main key has it.)
 3. Otherwise the key dialog.
 
 **Changed key:** if a remembered key matched the pak by its exact non-zero key GUID (step 1
@@ -234,7 +236,10 @@ front: the first remembered key is used; a decode failure is logged as "key may 
 **Key dialog:** modal, built from an in-memory dialog template (no resource compiler).
 Shows pak name, folder and key GUID; accepts 64 hex digits (optional `0x`, spaces ignored)
 or base64 of 32 bytes; repeats with an error line on a bad format or wrong key;
-"Remember for this folder and its subfolders" ticked by default. Cancel → `E_EABORTED`
+a checkbox **"Use for this session only (don't save it to uepak.keys.json)"**, unticked by
+default: unticked, the key is saved for the pak's folder and its subfolders; ticked, it is
+only kept until TC exits (e.g. paks copied into a scratch folder for testing). **[done]**
+The keys file is only ever written from this dialog. Cancel → `E_EABORTED`
 and no new prompt for the same pak for 10 s (TC opens a pak several times per operation).
 Every working key is kept in a session cache until TC exits, even when not remembered.
 
