@@ -87,6 +87,8 @@ pub struct PackOptions {
     pub oodle_compressor: repak::OodleCompressor,
     /// Largest undo copy made without asking (SPEC §4.4); `u64::MAX` = no limit.
     pub undo_limit: u64,
+    /// Rebuild the whole pak when changing it (no dead space, no undo file).
+    pub compact: bool,
 }
 
 pub const DEFAULT_UNDO_LIMIT: u64 = 1 << 30;
@@ -210,6 +212,7 @@ impl Default for PackOptions {
             level: None,
             oodle_compressor: repak::OodleCompressor::Mermaid,
             undo_limit: DEFAULT_UNDO_LIMIT,
+            compact: false,
         }
     }
 }
@@ -412,6 +415,11 @@ pub fn parse_options(text: &str) -> Options {
                     Some(l) => opts.pack.level = Some(l),
                     None => bad(),
                 },
+                "compact" => match raw.to_ascii_lowercase().as_str() {
+                    "1" | "yes" | "true" | "on" => opts.pack.compact = true,
+                    "0" | "no" | "false" | "off" | "" => opts.pack.compact = false,
+                    _ => bad(),
+                },
                 "undolimit" => match parse_bytes(raw) {
                     Some(b) => opts.pack.undo_limit = b,
                     None => bad(),
@@ -513,6 +521,9 @@ mod tests {
             4 << 30
         );
         assert_eq!(parse_options("[Pack]\nUndoLimit=0").pack.undo_limit, 0);
+        assert!(!d.pack.compact);
+        assert!(parse_options("[Pack]\nCompact=1").pack.compact);
+        assert!(!parse_options("[Pack]\nCompact=0").pack.compact);
         assert_eq!(
             parse_options("[Pack]\nUndoLimit=unlimited").pack.undo_limit,
             u64::MAX

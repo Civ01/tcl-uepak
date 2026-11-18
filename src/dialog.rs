@@ -26,12 +26,14 @@ pub static TEST_LAST_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex:
 
 #[cfg(test)]
 pub static TEST_CONFIRMS: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+pub static TEST_CONFIRM_TEXTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Yes/No question. Tests answer from `TEST_CONFIRMS` (empty = No).
 pub fn confirm(text: &str) -> bool {
     #[cfg(test)]
     {
-        let _ = text;
+        TEST_CONFIRM_TEXTS.lock().unwrap().push(text.to_string());
         let mut q = TEST_CONFIRMS.lock().unwrap();
         if q.is_empty() {
             false
@@ -348,6 +350,7 @@ mod settings_ui {
     const ID_DEFAULTS: u16 = 212;
     const ID_INIPATH: u16 = 213;
     const ID_UNDO: u16 = 214;
+    const ID_COMPACT: u16 = 215;
 
     const BUTTON: u16 = 0x80;
     const EDIT: u16 = 0x81;
@@ -382,7 +385,7 @@ mod settings_ui {
     }
 
     fn template() -> Vec<u32> {
-        let mut t = Tpl::dialog("UE PAK plugin settings", 320, 286);
+        let mut t = Tpl::dialog("UE PAK plugin settings", 320, 300);
         let label =
             |t: &mut Tpl, y: i16, text: &str| t.item(STATIC, 0, 14, y + 2, 84, 9, 0xFFFF, text);
         let combo = CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP;
@@ -392,7 +395,7 @@ mod settings_ui {
             6,
             4,
             308,
-            168,
+            182,
             0xFFFF,
             "Packing (new paks; existing paks keep their version and mount point)",
         );
@@ -419,14 +422,24 @@ mod settings_ui {
         t.item(COMBO, combo, 100, 103, 206, 100, ID_BLOCK, "");
         label(&mut t, 120, "Undo copy limit:");
         t.item(COMBO, combo, 100, 120, 206, 100, ID_UNDO, "");
-        t.item(STATIC, SS_NOPREFIX, 14, 138, 292, 32, ID_WARN, "");
-        t.item(BUTTON, BS_GROUPBOX, 6, 176, 308, 72, 0xFFFF, "Browsing");
-        label(&mut t, 190, "Mount point:");
+        t.item(
+            BUTTON,
+            BS_AUTOCHECKBOX | WS_TABSTOP,
+            14,
+            138,
+            290,
+            10,
+            ID_COMPACT,
+            "&Compact when changing a pak (rebuild it: no dead space, no undo copy)",
+        );
+        t.item(STATIC, SS_NOPREFIX, 14, 152, 292, 32, ID_WARN, "");
+        t.item(BUTTON, BS_GROUPBOX, 6, 190, 308, 72, 0xFFFF, "Browsing");
+        label(&mut t, 204, "Mount point:");
         t.item(
             BUTTON,
             BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
             100,
-            191,
+            205,
             80,
             10,
             ID_VIEW_FOLDER,
@@ -436,37 +449,37 @@ mod settings_ui {
             BUTTON,
             BS_AUTORADIOBUTTON,
             184,
-            191,
+            205,
             80,
             10,
             ID_VIEW_ROOT,
             "as &root",
         );
-        label(&mut t, 207, "Mount folders:");
-        t.item(COMBO, combo | WS_GROUP, 100, 207, 206, 100, ID_ATTR, "");
+        label(&mut t, 221, "Mount folders:");
+        t.item(COMBO, combo | WS_GROUP, 100, 221, 206, 100, ID_ATTR, "");
         t.item(
             BUTTON,
             BS_AUTOCHECKBOX | WS_TABSTOP,
             14,
-            226,
+            240,
             290,
             10,
             ID_DEBUG,
             "Write a &debug log (uepak.log)",
         );
-        t.item(STATIC, SS_NOPREFIX, 6, 252, 308, 9, ID_INIPATH, "");
-        t.item(BUTTON, WS_TABSTOP, 6, 266, 60, 14, ID_DEFAULTS, "&Defaults");
+        t.item(STATIC, SS_NOPREFIX, 6, 266, 308, 9, ID_INIPATH, "");
+        t.item(BUTTON, WS_TABSTOP, 6, 280, 60, 14, ID_DEFAULTS, "&Defaults");
         t.item(
             BUTTON,
             BS_DEFPUSHBUTTON | WS_TABSTOP,
             200,
-            266,
+            280,
             54,
             14,
             1,
             "OK",
         );
-        t.item(BUTTON, WS_TABSTOP, 260, 266, 54, 14, 2, "Cancel");
+        t.item(BUTTON, WS_TABSTOP, 260, 280, 54, 14, 2, "Cancel");
         t.into_dwords()
     }
 
@@ -599,6 +612,7 @@ mod settings_ui {
             m.view == crate::config::MountPointMode::Root,
         );
         set_check(hwnd, ID_DEBUG, m.debug_log);
+        set_check(hwnd, ID_COMPACT, m.compact);
         fill_levels(hwnd, st);
         show_warnings(hwnd, st);
         st.filling = false;
@@ -629,6 +643,7 @@ mod settings_ui {
             crate::config::MountPointMode::Folder
         };
         st.model.debug_log = checked(hwnd, ID_DEBUG);
+        st.model.compact = checked(hwnd, ID_COMPACT);
     }
 
     unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {

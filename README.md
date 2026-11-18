@@ -15,7 +15,13 @@ Status:
   multi-GB files); free-space check; replacing/removing the last files reuses their space,
   with an undo-size limit (`UndoLimit`, default 1 GB) above which it asks.
 
-Next: adding to encrypted paks and a compact rebuild (see SPEC.md §0).
+- **Encrypted paks:** F5/F8 work on encrypted paks after a confirmation, with the key from
+  the key prompt; new files and the index are encrypted like the pak's own (same format
+  as UnrealPak). New encrypted paks aren't created.
+- **Compact:** `Compact=1` (or the dialog checkbox) rebuilds the pak on every change: no
+  dead space from replaced or deleted files.
+
+Next: text search in archives and background operations (see SPEC.md §0).
 
 ## Install
 

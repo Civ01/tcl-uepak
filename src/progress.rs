@@ -37,6 +37,17 @@ pub fn report(name: &mut [u16], bytes: u64) -> bool {
     }
 }
 
+/// Sets the first progress bar to `percent` (TC's negative-size form, for
+/// work that isn't one of the files TC listed, like copying entries).
+/// Returns `false` if the user pressed Cancel.
+pub fn report_percent(name: &mut [u16], percent: u64) -> bool {
+    let Some(cb) = CALLBACK.with(|c| c.get()) else {
+        return true;
+    };
+    let p = percent.clamp(1, 100) as c_int;
+    unsafe { cb(name.as_mut_ptr(), -p) != 0 }
+}
+
 /// A writer that reports every write and turns Cancel into an error.
 pub struct Progress<W> {
     pub inner: W,

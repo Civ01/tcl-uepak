@@ -16,12 +16,12 @@ Document status: **v2** (2026-11-17). Markers: **[done]** implemented and tested
 | Reading | List, extract, test; pak versions 2–12; None/Zlib/Gzip/Zstd/LZ4/Oodle; >4 GB entries |
 | AES (read) | Key prompt, wrong-key detection, remembered keys (folder/parent, same GUID), session cache |
 | Views | `Folder` (default) with marked mount folders, `Root` |
-| Packing | New paks (Alt+F5), adding/replacing in existing paks (F5 into a pak), deleting (F8); every compression method with levels and Oodle compressor; crash-safe in-place changes with undo/recovery |
+| Packing | New paks (Alt+F5), adding/replacing in existing paks (F5 into a pak), deleting (F8); every compression method with levels and Oodle compressor; crash-safe in-place changes with undo/recovery; changing encrypted paks (after a confirmation); compact rebuild |
 | Settings | Configure dialog (TC's pack dialog / plugin settings) writing `uepak.ini` |
 | Robustness | Panic guard on every export, allocation guards in the fork, path-traversal checks, no partial output files |
 | Diagnostics | `DebugLog`, clipboard fallback, independent footer parser |
 | Large files | Streaming reads and writes (peak memory ~12 MB for 3 GB files), per-block progress/Cancel, free-space check, reuse of space at the end of the pak with an undo-size limit, SHA-1 check in "test" |
-| Tests | 55 automated tests (Windows CI); Wine-driven key and settings dialogs; index-hash verification; byte parity with repak |
+| Tests | 60 automated tests (Windows CI) + 168 in the fork; Wine-driven key and settings dialogs; index-hash verification; byte parity with repak and (encryption, compact copy) with UnrealPak's test paks |
 
 ### Roadmap
 
@@ -30,10 +30,10 @@ Document status: **v2** (2026-11-17). Markers: **[done]** implemented and tested
 | M1 | ✅ Modify existing paks | F5 into an open pak (add/replace), F8 delete, view-path mapping with the `Folder`-mode mount guard, per-archive mode memory, transactional append with undo file, crash recovery | F6 ✅ |
 | M2 | ✅ Settings dialog | `ConfigurePacker` dialog (§5); compression levels and Oodle compressor | F4 ✅ |
 | M3 | ✅ Large files | Streaming writes and block-by-block reads (constant memory, per-block progress), entry SHA-1 check in `PK_TEST`, free-space check, reuse of end-of-pak space with `UndoLimit` | F5, F7, F9 ✅ |
-| **M4** | **Encrypted modify + compact** (next) | Adding to/deleting from encrypted paks (§4.4), "Compact when modifying" rebuild | F10, F6 (copy stored entries) |
-| M5 | Polish | Text search in archives, background operations, v13–15 reading (no samples exist yet) | F8 |
+| M4 | ✅ Encrypted modify + compact | Adding to/deleting from encrypted paks (§4.4), "Compact when modifying" rebuild | F10, F6 ✅ |
+| **M5** | **Polish** (next) | Text search in archives, background operations, v13–15 reading (no samples exist yet) | F8 |
 
-Next: M4 (adding to encrypted paks, compact rebuild); M5 last.
+Next: M5 (text search, background operations, v13–15 reading).
 
 ### Backburner (no milestone)
 
@@ -56,8 +56,8 @@ Next: M4 (adding to encrypted paks, compact rebuild); M5 last.
 **Non-goals**
 
 - IoStore containers (`.utoc` / `.ucas`). Separate project.
-- Creating **new** encrypted paks. Existing encrypted paks will be modifiable (§4.4); the
-  AES key is symmetric, so the key that reads a pak can also write it.
+- Creating **new** encrypted paks. Existing encrypted paks can be changed (§4.4); the AES
+  key is symmetric, so the key that reads a pak can also write it.
 - Pak signing (`.sig` files). A modified signed pak fails signature checks in games that
   enforce them; documented, not handled.
 - 32-bit Total Commander.
@@ -194,9 +194,10 @@ same mount-point split (`view.rs`).
   so memory doesn't grow with entry size; progress and Cancel per block.
 - **[done]** `PK_TEST` also checks each entry's SHA-1 (`E_BAD_DATA` if damaged). The hash
   comes from the record stored before the data (v10+ index entries carry none). Rules,
-  verified on real Unreal paks (UE 4.22 – 5.9, incl. an encrypted one): the hash covers
-  the stored bytes; for encrypted compressed entries, the encrypted bytes including AES
-  padding. Encrypted uncompressed entries aren't checked (no consistent rule found).
+  verified on real Unreal paks (UE 4.22 – 5.9, incl. an encrypted one) and UnrealPak's
+  test paks: the hash covers the stored bytes; for encrypted compressed entries, the
+  encrypted bytes including AES padding; for encrypted stored entries, the encrypted bytes
+  without the padding (found in M4 with UnrealPak's test paks).
 
 ### 3.4 AES keys (reading) **[done]**
 
@@ -346,7 +347,7 @@ size (§6).
   `UEPAK_PARITY_PAK` test). Default levels match repak's (Zlib/Gzip 1, Zstd 3, Oodle
   Mermaid/Normal).
 
-### 4.4 Modifying existing paks **[done]** (encryption and compact: M4)
+### 4.4 Modifying existing paks **[done]**
 
 New/replaced data is written where the old index was (or earlier, see *space reuse*), then a
 new index and footer; the file is truncated to the new end. Existing data is never moved.
@@ -360,8 +361,7 @@ new index and footer; the file is truncated to the new end. Existing data is nev
   logged).
 - Verified: modified paks pass the UE index-hash checks; data before the old index is
   never touched.
-- **Refused:** v9 paks with a frozen index; versions repak can't write; (until M4)
-  encrypted paks.
+- **Refused:** v9 paks with a frozen index; versions repak can't write.
 - **Crash safety (transactional append):**
   1. Save the original tail (index + footer) to `<pak>.uepak-undo` and remember the length.
   2. Append data, write the new index and footer, flush.
@@ -387,18 +387,43 @@ new index and footer; the file is truncated to the new end. Existing data is nev
 - **[done] Free-space check:** undo copy + growth of the file (upper bound); ask if it may
   not fit.
 - **Dead space** elsewhere (not at the end) is not tracked; it stays until a compact
-  rebuild (M4).
-- **M4, encrypted paks:** allowed after a confirmation:
+  rebuild.
+- **[done] Encrypted paks:** changed after a confirmation (asked before anything else is
+  written; *No* leaves the pak untouched):
 
   > You are trying to add files to an encrypted pak. The new files and the pak's index
   > will be encrypted with the same key. Continue?
 
-  Key from the read lookup (§3.4). New entries encrypted if existing ones are; index
-  re-encrypted if it was; key GUID kept; footer hash = SHA-1 of the plain index. Applies
-  to delete and compact too.
-- **M4, compact when modifying** (`[Pack] Compact=1`, dialog checkbox): build a complete
-  new pak (`<pak>.uepak-new`) from the kept entries (stored bytes copied, no
-  recompression) plus the new ones, then replace the original. No dead space, no undo file.
+  The wording follows what is encrypted: index only ("its index will be encrypted again …;
+  its files aren't encrypted, so the new ones won't be either"), entries only ("the new
+  files will be encrypted with the same key as the files already in it"), or deleting
+  ("You are trying to delete files from an encrypted pak. Its index will be encrypted
+  again with the same key.").
+  - **Key:** the read lookup and dialog (§3.4), so a remembered key is used silently.
+    An encrypted index validates the key (index SHA-1). With a plain index and encrypted
+    entries, the key is checked by decompressing the smallest encrypted compressed entry;
+    if there is none (or it is Oodle without the library), the question says the key
+    can't be checked. Deleting from a pak whose index is plain needs no key and no
+    question (only the index changes).
+  - **What gets encrypted:** new entries if any existing entry is encrypted (empty files
+    never are, as UnrealPak does); the index again if it was; the key GUID is kept.
+  - **Format (fork F10), identical to UnrealPak:** each index part (primary, path hash,
+    full directory) is padded to 16 bytes by repeating its first bytes, hashed as padded
+    plaintext and encrypted; each part follows the padded previous one. Compressed
+    blocks are padded with the entry's first bytes, stored data with its own first bytes.
+    Checked against a real UE 5.6 pak (decrypted locally) and UnrealPak's test paks,
+    which our writer reproduces byte for byte (v7–v11; v5's UnrealPak filled padding with
+    arbitrary bytes).
+- **[done] Compact when modifying** (`[Pack] Compact=1`, dialog checkbox): builds a
+  complete new pak `<pak>.uepak-new` from the kept entries (record + stored bytes copied
+  in file order: no recompression, no re-encryption, Oodle entries need no library),
+  then the new files, then replaces the original. No dead space and no undo file: the
+  original is untouched until the final rename, and any failure or Cancel only deletes
+  the new file. Progress: the first bar shows the copy percentage. Free-space check: the
+  whole new pak. Applies to F5 into a pak and F8.
+  - Compacting also drops alignment padding UnrealPak may have added (the UE 5.6 sample
+    shrank from 9.16 to 8.19 MB: some entries started at 1–2 MB boundaries). Offsets in the
+    index are what games use, so this is safe on PC.
 
 ### 4.5 Deleting **[done]**
 
@@ -446,6 +471,8 @@ scaling through dialog units. Tested under Wine by driving the real controls.
 │   Oodle compressor[Mermaid                       ▼]   │
 │   Block size      [64 KB                         ▼]   │
 │   Undo copy limit [1 GB (default)                ▼]   │
+│   [ ] Compact when changing a pak (rebuild it: no     │
+│       dead space, no undo copy)                       │
 │   ⚠ (warnings: settings conflicts, Zstd/LZ4, large    │
 │      blocks, Oodle library found / not found)          │
 │                                                       │
@@ -471,8 +498,7 @@ scaling through dialog units. Tested under Wine by driving the real controls.
 - OK saves to `uepak.ini` in the settings directory with a small writer that keeps
   comments, order and line endings (instead of `WritePrivateProfileStringW`: same effect,
   but UTF-8 and testable on any OS). If that directory has no `uepak.ini` yet, the shipped
-  one is copied first. Defaults resets the fields without saving. Compact (M4) is not in
-  the dialog yet.
+  one is copied first. Defaults resets the fields without saving.
 
 ---
 
@@ -492,7 +518,7 @@ BlockSize=64K              ; bytes, or 64K / 1M                            [done
 Level=                     ; method-specific, empty = default              [done]
 OodleCompressor=Mermaid    ; Kraken | Mermaid | Selkie | Leviathan | Hydra [done]
 UndoLimit=1G               ; largest undo copy made without asking         [done]
-Compact=0                  ; 1 = full rebuild when modifying               (M4)
+Compact=0                  ; 1 = full rebuild when modifying               [done]
 ```
 
 - Keys are case-insensitive and ignore `_` (`DebugLog` = `debug_log`). **[done]**
@@ -548,11 +574,11 @@ BACKGROUND_PACK`: background-safe popups (key prompt, warnings) and locking arou
 | F3 | v12; `UnsupportedVersion`; probing reports `WrongKey` > `Encrypted` > `UnsupportedVersion`; wrong-key detection by index SHA-1; allocation guards; invalid UTF-16 names don't panic | ✅ |
 | F4 | Writer: configurable block size, store entries that don't shrink, `CompressionOptions` (levels, Oodle compressor/level) | ✅ |
 | F5 | `PakWriter::write_file_from_reader`: streaming writes from `Read + Seek`, progress/cancel; byte-identical to `write_file` (42 version × method combinations); >4 GB entries | ✅ |
-| F6 | `PakWriter` editing: `remove`, `rename_all`, `set_mount_point`, `set_compression*`, `paths`; `PakReader::index_offset`; new methods fill free footer slots | ✅ (copy stored entries between paks: M4) |
+| F6 | `PakWriter` editing: `remove`, `rename_all`, `set_mount_point`, `set_compression*`, `paths`; `PakReader::index_offset`; new methods fill free footer slots; `PakReader::new_pakwriter_like` + `PakWriter::copy_entry` (compact: stored bytes copied as-is, absolute block offsets moved; rebuilds all 48 UnrealPak test paks byte for byte) | ✅ |
 | F7 | Block-by-block reads and decompression; `EntryInfo::data_end`; `PakReader::into_pakwriter_at` (space reuse) | ✅ |
 | F8 | Read v13–15 | M5 |
 | F9 | `PakReader::read_file_verified` (entry SHA-1, rules verified on real paks); `HashMismatch`, `Cancelled` errors | ✅ |
-| F10 | AES writing: encrypted index and entries (16-byte padded blocks, AES-256-ECB), key GUID kept | M4 |
+| F10 | AES writing: `set_encrypt_entries` / `set_encrypt_index` / `set_encryption_guid`; padding and hashes as UnrealPak (byte-identical on its test paks); footer keeps the GUID; `read_file_verified` checks encrypted stored entries | ✅ |
 
 Each change gets fork tests; generally useful ones are offered upstream.
 
@@ -560,7 +586,7 @@ Each change gets fork tests; generally useful ones are offered upstream.
 
 ## 10. Testing
 
-**Automated (55 tests, run on Windows CI on every push):**
+**Automated (60 tests, run on Windows CI on every push):**
 
 - Reading: synthetic round trips for None/Zlib/Gzip/Zstd/LZ4, v12, mount folders and
   attributes, future version refused, non-pak refused, null/bad handles, panic guard,
@@ -574,13 +600,19 @@ Each change gets fork tests; generally useful ones are offered upstream.
 - Modifying: add/replace inside the mount, outside the mount (No → byte-identical, Yes →
   re-rooted with game paths unchanged, panel root → bare base), F8 files / folders / mount
   folders / no match, view-mode memory, cancel and read error → byte-identical rollback,
-  simulated crash → restore, pending undo refused, encrypted refused, new compression
-  slot.
+  simulated crash → restore, pending undo refused, new compression slot.
 - Large files / M3: replacing the last file 5× doesn't grow the pak, deleting it shrinks
   it; undo limit (No → append, Yes → reuse, No/No → unchanged); low free space asks
   (No → nothing written); `PK_TEST` catches a damaged entry; 40 MB file streams through
   pack + extract + test (`UEPAK_BIG_MB` for bigger: 3 GB measured at 12 MB peak memory);
   changed-key message for a stale same-GUID key.
+- Encrypted paks / M4: adding to each kind of encrypted test pak (index + entries,
+  entries only, index only), in place and compacted: No → byte-identical, the question's
+  wording, new entry encrypted like the pak, index still encrypted, key remembered,
+  extract + test with TC's calls; deleting (index encrypted: question; entries only: no
+  key, no question).
+- Compact: no gaps and the index right after the data, smaller than in place, low space
+  asks (No → unchanged, no temp file), a failing source leaves the original untouched.
 - Settings: ini writer (comments, order, CRLF, key variants), model ↔ ini round trip,
   shipped ini = defaults, choices and warnings.
 - Options parsing; key parsing (hex/base64); pack planning; view mapping (incl. Unicode).
@@ -649,6 +681,9 @@ read-only plugin folder (log to clipboard, settings in the `wincmd.ini` folder).
 
 1. **Packing in the field:** Oodle packing on Windows, and a plugin-packed mod pak loaded
    by a game.
+2. **Encrypted paks in the field:** a game loading a pak the plugin added files to (or
+   compacted) with its key; and the settings dialog's new Compact checkbox in TC (the Wine
+   harness no longer runs in the build sandbox).
 
 Resolved: Alt+F5 "replace the pak" moved to the backburner (§0); no size threshold
 between in-memory and streaming code paths (measured: no speed difference for small

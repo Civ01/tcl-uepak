@@ -1,4 +1,5 @@
-//! In-place modification of existing paks with crash safety (SPEC §4.4).
+//! Modification of existing paks with crash safety (SPEC §4.4): in place
+//! (`modify`) or as a full rebuild (`rebuild`, "Compact when modifying").
 //!
 //! New data is written where the old index was, then a new index and footer;
 //! the file is truncated to the new end. Before touching the file, the old
@@ -15,7 +16,7 @@ const UNDO_MAGIC: &[u8; 10] = b"UEPAKUNDO1";
 
 #[derive(Debug)]
 pub enum ModifyError {
-    /// Index or entries encrypted (modifying encrypted paks: M4).
+    /// Encrypted and no key was given.
     Encrypted,
     /// An interrupted earlier change must be resolved first.
     PendingUndo,
@@ -29,7 +30,7 @@ pub enum ModifyError {
 impl std::fmt::Display for ModifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ModifyError::Encrypted => f.write_str("the pak is encrypted"),
+            ModifyError::Encrypted => f.write_str("the pak is encrypted and no key was given"),
             ModifyError::PendingUndo => f.write_str("an interrupted earlier change is pending"),
             ModifyError::Io(e) => write!(f, "{e}"),
             ModifyError::Pak(e) => write!(f, "{e}"),
@@ -76,6 +77,9 @@ pub struct Inspect {
     pub spans: Vec<(u64, u64)>,
     pub index_offset: u64,
     pub file_len: u64,
+    pub encrypted_index: bool,
+    /// At least one entry is encrypted: new entries are encrypted too.
+    pub encrypted_entries: bool,
 }
 
 impl Inspect {
@@ -94,12 +98,29 @@ impl Inspect {
     }
 }
 
-pub fn inspect(pak: &Path) -> Result<Inspect, ModifyError> {
-    let mut r = BufReader::new(File::open(pak)?);
-    let p = repak::PakBuilder::new().reader(&mut r)?;
-    if p.encrypted_index() || p.entries().any(|(_, e)| e.encrypted) {
-        return Err(ModifyError::Encrypted);
+fn builder(key: Option<&crate::keys::AesKey>) -> repak::PakBuilder {
+    match key {
+        Some(k) => repak::PakBuilder::new().key(k.cipher()),
+        None => repak::PakBuilder::new(),
     }
+}
+
+/// Bytes of stored data of the entries kept when `removed` go away.
+impl Inspect {
+    pub fn kept_bytes(&self, removed: &[String]) -> u64 {
+        self.entries
+            .iter()
+            .zip(&self.spans)
+            .filter(|(p, _)| !removed.contains(p))
+            .map(|(_, (start, end))| end - start)
+            .sum()
+    }
+}
+
+pub fn inspect(pak: &Path, key: Option<&crate::keys::AesKey>) -> Result<Inspect, ModifyError> {
+    let mut r = BufReader::new(File::open(pak)?);
+    let p = builder(key).reader(&mut r)?;
+    let encrypted_entries = p.entries().any(|(_, e)| e.encrypted);
     let (entries, spans): (Vec<String>, Vec<(u64, u64)>) = p
         .entries()
         .map(|(path, e)| (path.to_string(), (e.offset, e.data_end)))
@@ -114,6 +135,8 @@ pub fn inspect(pak: &Path) -> Result<Inspect, ModifyError> {
         spans,
         index_offset: p.index_offset().unwrap_or(0),
         file_len: std::fs::metadata(pak)?.len(),
+        encrypted_index: p.encrypted_index(),
+        encrypted_entries,
     })
 }
 
@@ -135,6 +158,7 @@ fn rollback(file: &mut File, index_offset: u64, tail: &[u8], len: u64) -> io::Re
 /// anything is written.
 pub fn modify<F>(
     pak: &Path,
+    key: Option<&crate::keys::AesKey>,
     removals: &[String],
     write_at: Option<u64>,
     edit: F,
@@ -149,11 +173,11 @@ where
     let len = file.metadata()?.len();
     let reader = {
         let mut r = BufReader::new(&mut file);
-        repak::PakBuilder::new().reader(&mut r)?
+        builder(key).reader(&mut r)?
     };
-    if reader.encrypted_index() || reader.entries().any(|(_, e)| e.encrypted) {
-        return Err(ModifyError::Encrypted);
-    }
+    // new entries are encrypted like the existing ones (the caller makes
+    // sure there is a key when adding)
+    let encrypt_new = key.is_some() && reader.entries().any(|(_, e)| e.encrypted);
     let index_offset = reader
         .index_offset()
         .ok_or_else(|| ModifyError::User("pak has no index offset".into()))?;
@@ -200,6 +224,8 @@ where
     // 2. edit + new index + truncate
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut w = reader.into_pakwriter_at(BufWriter::new(&mut file), index_offset)?;
+        // the index keeps its encryption (and key GUID) when reopened
+        w.set_encrypt_entries(encrypt_new);
         for r in removals {
             w.remove(r);
         }
@@ -234,6 +260,101 @@ where
         Err(panic) => {
             let _ = rollback(&mut file, index_offset, &tail, len)
                 .map(|_| std::fs::remove_file(undo_path(pak)));
+            std::panic::resume_unwind(panic)
+        }
+    }
+}
+
+pub fn rebuild_path(pak: &Path) -> PathBuf {
+    let mut name = pak.file_name().unwrap_or_default().to_os_string();
+    name.push(".uepak-new");
+    pak.with_file_name(name)
+}
+
+/// "Compact when modifying" (SPEC §4.4): builds a complete new pak in
+/// `<pak>.uepak-new` from the entries kept after `removals` (stored bytes
+/// copied in file order: no recompression, no re-encryption), then runs
+/// `edit` on it (rename, new files), writes the index and replaces the
+/// original. No dead space and no undo file: until the final rename the
+/// original is untouched, and any failure only deletes the new file.
+/// `progress(copied, total)` reports the copy; `false` cancels. Returns the
+/// new file size.
+pub fn rebuild<F>(
+    pak: &Path,
+    key: Option<&crate::keys::AesKey>,
+    removals: &[String],
+    progress: &mut dyn FnMut(u64, u64) -> bool,
+    edit: F,
+) -> Result<u64, ModifyError>
+where
+    F: FnOnce(&mut repak::PakWriter<BufWriter<&mut File>>) -> Result<(), ModifyError>,
+{
+    if has_undo(pak) {
+        return Err(ModifyError::PendingUndo);
+    }
+    let mut src = BufReader::new(File::open(pak)?);
+    let reader = builder(key).reader(&mut src)?;
+    let encrypt_new = key.is_some() && reader.entries().any(|(_, e)| e.encrypted);
+    let mut kept: Vec<(u64, u64, String)> = reader
+        .entries()
+        .filter(|(p, _)| !removals.iter().any(|r| r == p))
+        .map(|(p, e)| (e.offset, e.data_end - e.offset, p.to_string()))
+        .collect();
+    kept.sort();
+    let total: u64 = kept.iter().map(|k| k.1).sum();
+    let tmp = rebuild_path(pak);
+    let mut out = File::create(&tmp)?;
+    dlog!(
+        "  compacting: {} entries ({total} bytes) -> {}",
+        kept.len(),
+        tmp.display()
+    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut w = reader.new_pakwriter_like(BufWriter::new(&mut out));
+        w.set_encrypt_entries(encrypt_new);
+        let mut copied = 0u64;
+        for (_, _, path) in &kept {
+            w.copy_entry(&reader, path, path, &mut src, &mut |n| {
+                copied += n;
+                progress(copied, total)
+            })
+            .map_err(|e| match e {
+                repak::Error::Cancelled => ModifyError::Aborted,
+                e => ModifyError::Pak(e),
+            })?;
+        }
+        edit(&mut w)?;
+        let w = w.write_index()?;
+        let f = w
+            .into_inner()
+            .map_err(|e| ModifyError::Io(e.into_error()))?;
+        let end = f.stream_position()?;
+        f.sync_all()?;
+        Ok::<u64, ModifyError>(end)
+    }));
+    drop(src);
+    drop(out);
+    match result {
+        Ok(Ok(end)) => match std::fs::rename(&tmp, pak) {
+            Ok(()) => {
+                dlog!("  compacted: replaced the pak ({end} bytes)");
+                Ok(end)
+            }
+            Err(e) => {
+                dlog!("  could not replace the pak with the rebuilt one: {e}");
+                let _ = std::fs::remove_file(&tmp);
+                Err(ModifyError::User(format!(
+                    "The rebuilt pak could not replace the original ({e}). The original is unchanged."
+                )))
+            }
+        },
+        Ok(Err(e)) => {
+            dlog!("  rebuild failed ({e}); original unchanged");
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+        Err(panic) => {
+            let _ = std::fs::remove_file(&tmp);
             std::panic::resume_unwind(panic)
         }
     }

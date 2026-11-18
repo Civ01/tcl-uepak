@@ -1067,14 +1067,7 @@ fn interrupted_change_is_restored_on_open() {
 #[test]
 fn modify_refusals() {
     let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-    // encrypted pak (repak test pak): refused, untouched
-    let enc = copy_to_tmp("mod-enc", &testdata("enc_entries.pak"));
-    let before = std::fs::read(&enc).unwrap();
-    assert_eq!(
-        delete_ffi(&enc, "mount\\point\\root\\test.txt"),
-        E_NOT_SUPPORTED
-    );
-    assert_eq!(std::fs::read(&enc).unwrap(), before);
+    // (encrypted paks are no longer refused: see the M4 tests)
     // adding a new compression method fills a free footer slot
     let (pak, src) = base_pak("mod-slot");
     list(&pak).unwrap();
@@ -1111,6 +1104,8 @@ fn reroot_question_explains_the_new_folder() {
         spans: vec![(0, 100)],
         index_offset: 100,
         file_len: 300,
+        encrypted_index: false,
+        encrypted_entries: false,
     };
     let mount = crate::view::Mount::parse(&info.mount);
     let plan = pack::plan(
@@ -1379,4 +1374,331 @@ fn stale_key_for_same_guid_says_it_probably_changed() {
         .unwrap_or_default();
     assert!(shown.contains("re-encrypted with a new key"), "{shown}");
     crate::keys::clear_session();
+}
+
+// ---------------------------------------------------------------------------
+// M4: changing encrypted paks, compact rebuild
+
+/// Locks for tests that use both the key prompt and confirm queues (always
+/// in this order), with clean key state.
+fn m4_locks() -> (
+    std::sync::MutexGuard<'static, ()>,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    let k = KEY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let c = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::keys::clear_session();
+    let _ = std::fs::remove_file(keys_file());
+    crate::dialog::TEST_ANSWERS.lock().unwrap().clear();
+    crate::dialog::TEST_CONFIRM_TEXTS.lock().unwrap().clear();
+    super::DECLINED.lock().unwrap().clear();
+    (k, c)
+}
+
+fn test_key() -> crate::keys::AesKey {
+    crate::keys::AesKey::parse(TEST_KEY_B64).unwrap()
+}
+
+/// (entry, data, encrypted) read with `key`, every hash checked.
+fn keyed_read_back(pak: &Path, key: &crate::keys::AesKey) -> Vec<(String, Vec<u8>, bool)> {
+    let mut f = std::io::BufReader::new(std::fs::File::open(pak).unwrap());
+    let r = repak::PakBuilder::new()
+        .key(key.cipher())
+        .reader(&mut f)
+        .unwrap();
+    let oodle = oodle_loader::oodle().is_ok();
+    let mut out: Vec<_> = r
+        .entries()
+        .map(|(p, e)| (p.to_string(), e))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|(p, e)| {
+            if e.compression == Some(repak::Compression::Oodle) && !oodle {
+                // can't decompress here: compare sizes instead
+                let d = format!("oodle {} {}", e.compressed_size, e.uncompressed_size);
+                return (p, d.into_bytes(), e.encrypted);
+            }
+            let mut d = vec![];
+            r.read_file_verified(&p, &mut f, &mut d)
+                .unwrap_or_else(|e| panic!("{p}: {e}"));
+            (p, d, e.encrypted)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn one_file_plan(name: &str, data: &[u8]) -> pack::Plan {
+    let src = tmp(name).join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("added.txt"), data).unwrap();
+    pack::plan(&src, None, &["added.txt".to_string()], 2).unwrap()
+}
+
+fn confirm_texts() -> Vec<String> {
+    std::mem::take(&mut *crate::dialog::TEST_CONFIRM_TEXTS.lock().unwrap())
+}
+
+#[test]
+fn adding_to_encrypted_paks_asks_and_encrypts_like_the_pak() {
+    use crate::config::MountPointMode::Root;
+    let key = test_key();
+    // (test pak, index encrypted, entries encrypted, key can be checked)
+    for (file, enc_index, enc_entries, checked) in [
+        ("enc_index.pak", true, true, true),
+        ("enc_entries.pak", false, true, false),
+        ("enc_index_only.pak", true, false, true),
+    ] {
+        for compact in [false, true] {
+            let _l = m4_locks();
+            let pak = copy_to_tmp(&format!("m4-add-{file}-{compact}"), &testdata(file));
+            let before = std::fs::read(&pak).unwrap();
+            let old = keyed_read_back(&pak, &key);
+            let data = b"added to an encrypted pak ".repeat(3000);
+            let plan = one_file_plan(&format!("m4-add-src-{file}-{compact}"), &data);
+            let opts = crate::config::PackOptions {
+                compact,
+                ..Default::default()
+            };
+            // key from the prompt, then "No" to the encryption question
+            answer(Some((TEST_KEY_B64, false)));
+            confirm_next(&[false]);
+            let r = pack::add_to_existing(&pak, &plan, Root, &opts);
+            assert!(matches!(r, Err(pack::PackError::Aborted)), "{file}: {r:?}");
+            assert_eq!(
+                std::fs::read(&pak).unwrap(),
+                before,
+                "{file}: unchanged after No"
+            );
+            let q = confirm_texts();
+            assert_eq!(q.len(), 1, "{file}: {q:?}");
+            assert!(
+                q[0].starts_with("You are trying to add files to an encrypted pak"),
+                "{}",
+                q[0]
+            );
+            assert_eq!(q[0].contains("can't be checked"), !checked, "{}", q[0]);
+
+            // "Yes": the key is remembered for the session, no second prompt
+            confirm_next(&[true]);
+            let st = pack::add_to_existing(&pak, &plan, Root, &opts).unwrap();
+            assert!(crate::dialog::TEST_ANSWERS.lock().unwrap().is_empty());
+            assert_eq!(st.added, 1);
+            assert_eq!(st.compacted, compact);
+            assert!(!crate::modify::has_undo(&pak));
+            assert!(!crate::modify::rebuild_path(&pak).exists());
+            let sniff = archive::sniff_footer(&pak).unwrap();
+            assert_eq!(sniff.encrypted_index, Some(enc_index), "{file}");
+            if enc_index {
+                let mut f = std::io::BufReader::new(std::fs::File::open(&pak).unwrap());
+                assert!(matches!(
+                    repak::PakBuilder::new().reader(&mut f),
+                    Err(repak::Error::Encrypted)
+                ));
+            }
+            let now = keyed_read_back(&pak, &key);
+            assert_eq!(now.len(), old.len() + 1);
+            let added = now.iter().find(|(p, _, _)| p == "added.txt").unwrap();
+            assert_eq!(added.1, data);
+            assert_eq!(
+                added.2, enc_entries,
+                "{file}: new entry encrypted like the pak's"
+            );
+            for o in &old {
+                assert!(now.contains(o), "{file}: {} kept", o.0);
+            }
+            // TC's own list + extract + test pass, with the remembered key
+            let out = extract_all(&pak, &tmp(&format!("m4-add-out-{file}-{compact}")));
+            assert!(out
+                .iter()
+                .any(|(n, d)| n.ends_with("added.txt") && *d == data));
+            crate::keys::clear_session();
+        }
+    }
+}
+
+#[test]
+fn deleting_from_encrypted_paks() {
+    use crate::config::MountPointMode::Root;
+    let key = test_key();
+    for compact in [false, true] {
+        let opts = crate::config::PackOptions {
+            compact,
+            ..Default::default()
+        };
+        // encrypted index: key + confirmation
+        let _l = m4_locks();
+        let pak = copy_to_tmp(&format!("m4-del-idx-{compact}"), &testdata("enc_index.pak"));
+        let old = keyed_read_back(&pak, &key);
+        let victim = old[0].0.clone();
+        answer(Some((TEST_KEY_B64, false)));
+        confirm_next(&[true]);
+        let st = pack::delete_entries(&pak, &[victim.replace('/', "\\")], Root, &opts).unwrap();
+        assert_eq!(st.removed, 1);
+        let q = confirm_texts();
+        assert!(
+            q[0].starts_with("You are trying to delete files from an encrypted pak"),
+            "{q:?}"
+        );
+        let now = keyed_read_back(&pak, &key);
+        assert_eq!(now, old[1..].to_vec());
+        assert_eq!(
+            archive::sniff_footer(&pak).unwrap().encrypted_index,
+            Some(true)
+        );
+        drop(_l);
+
+        // plain index, encrypted entries: index-only change, no key, no question
+        let _l = m4_locks();
+        let pak = copy_to_tmp(
+            &format!("m4-del-ent-{compact}"),
+            &testdata("enc_entries.pak"),
+        );
+        let old = keyed_read_back(&pak, &key);
+        let victim = old.last().unwrap().0.clone();
+        pack::delete_entries(&pak, &[victim.replace('/', "\\")], Root, &opts).unwrap();
+        assert!(confirm_texts().is_empty());
+        assert!(crate::dialog::TEST_ANSWERS.lock().unwrap().is_empty());
+        let now = keyed_read_back(&pak, &key);
+        assert_eq!(now, old[..old.len() - 1].to_vec());
+    }
+}
+
+/// Entries lie back to back from the start, and the index follows the last.
+fn assert_no_dead_space(pak: &Path) {
+    let mut f = std::io::BufReader::new(std::fs::File::open(pak).unwrap());
+    let r = repak::PakBuilder::new().reader(&mut f).unwrap();
+    let mut spans: Vec<(u64, u64)> = r.entries().map(|(_, e)| (e.offset, e.data_end)).collect();
+    spans.sort();
+    let mut at = 0;
+    for (start, end) in spans {
+        assert_eq!(start, at, "gap before {start}");
+        at = end;
+    }
+    assert_eq!(r.index_offset(), Some(at), "index right after the data");
+}
+
+#[test]
+fn compact_rebuild_leaves_no_dead_space() {
+    use crate::config::MountPointMode::Root;
+    let _l = m4_locks();
+    let dir = tmp("m4-compact");
+    let pak = dir.join("c.pak");
+    let files: Vec<(&str, Vec<u8>)> = vec![
+        ("a/first.txt", b"first ".repeat(20_000)),
+        ("b/second.txt", b"second ".repeat(20_000)),
+        ("c/third.txt", b"third ".repeat(20_000)),
+    ];
+    make_pak(&pak, Some(repak::Compression::Zlib), &files);
+    let fresh_size = std::fs::metadata(&pak).unwrap().len();
+    assert_no_dead_space(&pak);
+    // in-place replace of a file that isn't last leaves dead space
+    let src = dir.join("src").join("a");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("first.txt"), b"first ".repeat(20_000)).unwrap();
+    let plan = pack::plan(&dir.join("src"), None, &["a\\first.txt".to_string()], 2).unwrap();
+    let plain = crate::config::PackOptions::default();
+    pack::add_to_existing(&pak, &plan, Root, &plain).unwrap();
+    let grown = std::fs::metadata(&pak).unwrap().len();
+    assert!(grown > fresh_size + 100, "{grown} vs {fresh_size}");
+    // compacting: the same replace again gives exactly a fresh pak's size
+    let compact = crate::config::PackOptions {
+        compact: true,
+        ..Default::default()
+    };
+    let st = pack::add_to_existing(&pak, &plan, Root, &compact).unwrap();
+    assert!(st.compacted);
+    let size = std::fs::metadata(&pak).unwrap().len();
+    assert!(size < grown, "{size} vs {grown}");
+    assert_no_dead_space(&pak);
+    let mut expected: Vec<_> = files
+        .iter()
+        .map(|(n, d)| (n.to_string(), d.clone()))
+        .collect();
+    expected.sort();
+    assert_eq!(read_back(&pak), expected);
+    // compact delete: smaller than an in-place delete would leave it
+    pack::delete_entries(&pak, &["b\\second.txt".to_string()], Root, &compact).unwrap();
+    let after_delete = std::fs::metadata(&pak).unwrap().len();
+    assert!(after_delete < size - 1000, "{after_delete} vs {size}");
+    assert_no_dead_space(&pak);
+    assert_eq!(read_back(&pak).len(), 2);
+    // low space: asked, No leaves the pak alone and no temp file behind
+    let before = std::fs::read(&pak).unwrap();
+    pack::TEST_FREE_SPACE.with(|c| c.set(Some(10)));
+    confirm_next(&[false]);
+    let r = pack::add_to_existing(&pak, &plan, Root, &compact);
+    pack::TEST_FREE_SPACE.with(|c| c.set(None));
+    assert!(matches!(r, Err(pack::PackError::Aborted)));
+    assert!(confirm_texts()[0].contains("Rebuilding this pak"));
+    assert_eq!(std::fs::read(&pak).unwrap(), before);
+    assert!(!crate::modify::rebuild_path(&pak).exists());
+}
+
+#[test]
+fn failed_compact_keeps_the_original() {
+    use crate::config::MountPointMode::Root;
+    let _l = m4_locks();
+    let dir = tmp("m4-compact-fail");
+    let pak = dir.join("f.pak");
+    make_pak(&pak, None, &payload());
+    let before = std::fs::read(&pak).unwrap();
+    // a source that disappears between planning and packing
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("gone.txt"), b"x").unwrap();
+    let plan = pack::plan(&src, None, &["gone.txt".to_string()], 2).unwrap();
+    std::fs::remove_file(src.join("gone.txt")).unwrap();
+    let compact = crate::config::PackOptions {
+        compact: true,
+        ..Default::default()
+    };
+    let r = pack::add_to_existing(&pak, &plan, Root, &compact);
+    assert!(matches!(r, Err(pack::PackError::Read(..))), "{r:?}");
+    assert_eq!(std::fs::read(&pak).unwrap(), before);
+    assert!(!crate::modify::rebuild_path(&pak).exists());
+}
+
+/// Optional: add to / compact a copy of a real encrypted pak
+/// (`UEPAK_KEYED_PAK`, `UEPAK_KEYED_KEY`; keys never committed).
+#[test]
+fn real_encrypted_pak_add_and_compact_from_env() {
+    use crate::config::MountPointMode::Root;
+    let (Ok(p), Ok(k)) = (
+        std::env::var("UEPAK_KEYED_PAK"),
+        std::env::var("UEPAK_KEYED_KEY"),
+    ) else {
+        return;
+    };
+    let key = crate::keys::AesKey::parse(&k).unwrap();
+    for compact in [false, true] {
+        let _l = m4_locks();
+        let pak = copy_to_tmp(&format!("m4-real-{compact}"), Path::new(&p));
+        let old = keyed_read_back(&pak, &key);
+        let data = b"real pak addition ".repeat(10_000);
+        let plan = one_file_plan(&format!("m4-real-src-{compact}"), &data);
+        let opts = crate::config::PackOptions {
+            compact,
+            compression: crate::config::PackCompression::Zlib,
+            ..Default::default()
+        };
+        answer(Some((&k, false)));
+        confirm_next(&[true]);
+        pack::add_to_existing(&pak, &plan, Root, &opts).unwrap();
+        let now = keyed_read_back(&pak, &key);
+        assert_eq!(now.len(), old.len() + 1);
+        let added = now.iter().find(|(p, _, _)| p == "added.txt").unwrap();
+        assert_eq!(added.1, data);
+        let any_enc = old.iter().any(|o| o.2);
+        assert_eq!(added.2, any_enc);
+        for o in &old {
+            assert!(now.contains(o));
+        }
+        println!(
+            "real pak, compact={compact}: {} -> {} bytes",
+            std::fs::metadata(Path::new(&p)).unwrap().len(),
+            std::fs::metadata(&pak).unwrap().len()
+        );
+        crate::keys::clear_session();
+    }
 }

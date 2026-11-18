@@ -84,6 +84,7 @@ pub struct Model {
     pub oodle_compressor: repak::OodleCompressor,
     pub block_size: u32,
     pub undo_limit: u64,
+    pub compact: bool,
     pub view: MountPointMode,
     pub mount_folder_attr: u32,
     pub debug_log: bool,
@@ -99,6 +100,7 @@ impl Model {
             oodle_compressor: o.pack.oodle_compressor,
             block_size: o.pack.block_size,
             undo_limit: o.pack.undo_limit,
+            compact: o.pack.compact,
             view: o.mount_point,
             mount_folder_attr: o.mount_folder_attr,
             debug_log: o.debug_log,
@@ -192,6 +194,7 @@ impl Model {
             level: self.level,
             oodle_compressor: self.oodle_compressor,
             undo_limit: self.undo_limit,
+            compact: self.compact,
         };
         if let Err(e) = crate::pack::check_settings(&opts) {
             w.push(e);
@@ -281,6 +284,11 @@ impl Model {
             ("Pack", "OodleCompressor", oodle),
             ("Pack", "BlockSize", self.block_size.to_string()),
             ("Pack", "UndoLimit", undo_limit_text(self.undo_limit)),
+            (
+                "Pack",
+                "Compact",
+                if self.compact { "1" } else { "0" }.into(),
+            ),
         ]
     }
 }
@@ -406,6 +414,7 @@ mod tests {
         m.oodle_compressor = repak::OodleCompressor::Kraken;
         m.block_size = 262144;
         m.undo_limit = 4 << 30;
+        m.compact = true;
         m.view = MountPointMode::Root;
         m.mount_folder_attr = ATTR_HIDDEN;
         m.debug_log = true;

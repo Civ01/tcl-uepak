@@ -206,6 +206,74 @@ pub(crate) fn ensure_entry_key(arc: &mut Archive) -> Result<(), c_int> {
     })
 }
 
+/// The AES key for changing an encrypted pak (SPEC §4.4).
+pub(crate) struct WriteKey {
+    pub key: Option<keys::AesKey>,
+    /// The key was confirmed: by the index hash (encrypted index) or by
+    /// decompressing an encrypted entry. Paks whose only encrypted entries
+    /// are stored uncompressed can't be checked.
+    pub checked: bool,
+}
+
+/// Finds the key for changing `path`: `key: None` for unencrypted paks.
+/// Uses the same lookup and dialog as opening (§3.4). With `entries` (adding
+/// files) a plain index with encrypted entries needs the key too; it is
+/// checked by decompressing the smallest encrypted compressed entry, when
+/// there is one. Deleting from such a pak needs no key.
+pub(crate) fn key_for_writing(path: &Path, entries: bool) -> Result<WriteKey, OpenError> {
+    let options = config::load_options();
+    let mut arc = open_with_keys(path, &options)?;
+    if let Some(key) = arc.key {
+        return Ok(WriteKey {
+            key: Some(key),
+            checked: true,
+        });
+    }
+    if !entries || !arc.pak().entries().any(|(_, e)| e.encrypted) {
+        return Ok(WriteKey {
+            key: None,
+            checked: true,
+        });
+    }
+    dlog!("  plain index, encrypted entries: looking for a key");
+    if ensure_entry_key(&mut arc).is_err() {
+        return Err(OpenError::Cancelled);
+    }
+    let key = arc.key;
+    let probe = arc
+        .pak()
+        .entries()
+        .filter(|(_, e)| e.encrypted && e.compression.is_some())
+        .min_by_key(|(_, e)| e.compressed_size)
+        .map(|(p, _)| p.to_string());
+    let Some(probe) = probe else {
+        dlog!("  no encrypted compressed entry: the key can't be checked");
+        return Ok(WriteKey {
+            key,
+            checked: false,
+        });
+    };
+    let file = std::fs::File::open(path).map_err(OpenError::Io)?;
+    let mut r = std::io::BufReader::new(file);
+    match arc.pak().read_file(&probe, &mut r, &mut std::io::sink()) {
+        Ok(()) => {
+            dlog!("  key checked by decompressing {probe}");
+            Ok(WriteKey { key, checked: true })
+        }
+        Err(e @ (repak::Error::Oodle | repak::Error::OodleFailed(_))) => {
+            dlog!("  key can't be checked on {probe}: {e}");
+            Ok(WriteKey {
+                key,
+                checked: false,
+            })
+        }
+        Err(e) => {
+            dlog!("  key check failed on {probe}: {e}");
+            Err(OpenError::WrongKey)
+        }
+    }
+}
+
 /// View mode each pak was last listed with (lowercased path -> mode), so
 /// PackFiles/DeleteFiles map TC's view paths the same way (SPEC §3.2).
 pub(crate) static VIEW_MODES: Mutex<Vec<(String, config::MountPointMode)>> = Mutex::new(Vec::new());

@@ -417,9 +417,7 @@ impl From<ModifyError> for PackError {
     fn from(e: ModifyError) -> Self {
         match e {
             ModifyError::Encrypted => PackError::User(
-                "This pak is encrypted. Changing encrypted paks is not supported yet \
-                 (planned: SPEC milestone M4)."
-                    .into(),
+                "This pak is encrypted, and no AES key for it was given.".into(),
                 E_NOT_SUPPORTED,
             ),
             ModifyError::PendingUndo => PackError::User(
@@ -461,6 +459,64 @@ fn check_oodle(opts: &PackOptions) -> Result<(), PackError> {
     Ok(())
 }
 
+/// The key for changing `target` (prompting like opening does), mapped to
+/// pack errors.
+fn write_key(target: &Path, adding: bool) -> Result<crate::read::WriteKey, PackError> {
+    use crate::archive::OpenError;
+    crate::read::key_for_writing(target, adding).map_err(|e| match e {
+        OpenError::Cancelled => PackError::Aborted,
+        OpenError::WrongKey => PackError::User(
+            "The AES key for this pak doesn't decrypt its files, so new files can't be \
+             encrypted for it. Remove the key from uepak.keys.json and enter the right one."
+                .into(),
+            E_NOT_SUPPORTED,
+        ),
+        OpenError::Encrypted => PackError::User(
+            "This pak is encrypted, and no AES key for it was given.".into(),
+            E_NOT_SUPPORTED,
+        ),
+        e => PackError::User(format!("Could not open the pak: {e}"), E_BAD_ARCHIVE),
+    })
+}
+
+/// Text of the confirmation before changing an encrypted pak (SPEC §4.4),
+/// or `None` if nothing in the change gets encrypted.
+pub fn encrypted_question(
+    info: &modify::Inspect,
+    key: &crate::read::WriteKey,
+    adding: bool,
+) -> Option<String> {
+    let mut text = match (adding, info.encrypted_index, info.encrypted_entries) {
+        (true, true, true) => "You are trying to add files to an encrypted pak. The new files and \
+             the pak's index will be encrypted with the same key."
+            .to_string(),
+        (true, true, false) => {
+            "You are trying to add files to an encrypted pak. Its index will be \
+             encrypted again with the same key; its files aren't encrypted, so the new ones won't \
+             be either."
+                .to_string()
+        }
+        (true, false, true) => {
+            "You are trying to add files to an encrypted pak. The new files will \
+             be encrypted with the same key as the files already in it (its index isn't encrypted)."
+                .to_string()
+        }
+        (false, true, _) => "You are trying to delete files from an encrypted pak. Its index will \
+             be encrypted again with the same key."
+            .to_string(),
+        _ => return None,
+    };
+    if adding && !key.checked {
+        text.push_str(
+            "\n\nThe key can't be checked for this pak (its index isn't encrypted and none of \
+             its encrypted files is compressed). If the key is wrong, the game can't read the \
+             new files.",
+        );
+    }
+    text.push_str("\n\nContinue?");
+    Some(text)
+}
+
 #[derive(Debug, Default)]
 pub struct ModifyStats {
     /// Bytes of space at the end of the data area that were reused.
@@ -471,6 +527,10 @@ pub struct ModifyStats {
     pub input_bytes: u64,
     pub new_mount: Option<String>,
     pub pak_bytes: u64,
+    /// The pak was rebuilt ("Compact when modifying").
+    pub compacted: bool,
+    /// Size before the change.
+    pub old_bytes: u64,
 }
 
 /// Adds/replaces files in an existing pak (F5 into a pak, Alt+F5 onto one).
@@ -483,7 +543,8 @@ pub fn add_to_existing(
     if modify::has_undo(target) {
         return Err(ModifyError::PendingUndo.into());
     }
-    let info = modify::inspect(target)?;
+    let key = write_key(target, true)?;
+    let info = modify::inspect(target, key.key.as_ref())?;
     let mount = view::Mount::parse(&info.mount);
     let views: Vec<Vec<String>> = plan.files.iter().map(|f| f.view.clone()).collect();
     let mapping = view::map_add(mode, &mount, &views);
@@ -502,6 +563,11 @@ pub fn add_to_existing(
                 format!("Several files would get the same path in the pak: {e}"),
                 E_EABORTED,
             ));
+        }
+    }
+    if let Some(text) = encrypted_question(&info, &key, true) {
+        if !crate::dialog::confirm(&text) {
+            return Err(PackError::Aborted);
         }
     }
     if mapping.new_mount.is_some() {
@@ -557,35 +623,41 @@ pub fn add_to_existing(
         })
         .cloned()
         .collect();
-    let write_at = choose_write_at(&info, &removals, opts.undo_limit)?;
-    let start = write_at.unwrap_or(info.index_offset);
-    let new_end = start
-        + source_bytes(plan)
-        + index_estimate(
-            info.entries
-                .iter()
-                .map(|p| p.len() + mapping.reroot_prefix.len())
-                .chain(mapping.entries.iter().map(|e| e.len())),
-        );
-    let need = (info.file_len - start) + new_end.saturating_sub(info.file_len);
-    check_space(
-        target.parent().unwrap_or(Path::new(".")),
-        need,
-        "Changing this pak",
-    )?;
+    let index_size = index_estimate(
+        info.entries
+            .iter()
+            .map(|p| p.len() + mapping.reroot_prefix.len())
+            .chain(mapping.entries.iter().map(|e| e.len())),
+    );
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let write_at = if opts.compact {
+        // a complete new pak next to the old one
+        let need = info.kept_bytes(&removals) + source_bytes(plan) + index_size;
+        check_space(dir, need, "Rebuilding this pak (Compact)")?;
+        None
+    } else {
+        let write_at = choose_write_at(&info, &removals, opts.undo_limit)?;
+        let start = write_at.unwrap_or(info.index_offset);
+        let new_end = start + source_bytes(plan) + index_size;
+        let need = (info.file_len - start) + new_end.saturating_sub(info.file_len);
+        check_space(dir, need, "Changing this pak")?;
+        write_at
+    };
 
     let compress = opts.compression != PackCompression::None;
     let mut stats = ModifyStats {
         new_mount: mapping.new_mount.clone(),
         replaced: removals.len(),
-        reused: info.index_offset - start,
+        reused: info.index_offset - write_at.unwrap_or(info.index_offset),
+        compacted: opts.compact,
+        old_bytes: info.file_len,
         ..Default::default()
     };
     for r in &removals {
         dlog!("  replacing {r}");
     }
     let mut failure: Option<PackError> = None;
-    let result = modify::modify(target, &removals, write_at, |w| {
+    let edit = |w: &mut repak::PakWriter<std::io::BufWriter<&mut std::fs::File>>| {
         if let Some(c) = opts.compression.repak() {
             w.set_compression([c]);
         } else {
@@ -613,7 +685,18 @@ pub fn add_to_existing(
             }
         }
         Ok(())
-    });
+    };
+    let result = if opts.compact {
+        modify::rebuild(
+            target,
+            key.key.as_ref(),
+            &removals,
+            &mut compact_progress(target),
+            edit,
+        )
+    } else {
+        modify::modify(target, key.key.as_ref(), &removals, write_at, edit)
+    };
     match (result, failure) {
         (Ok(bytes), _) => {
             stats.pak_bytes = bytes;
@@ -621,6 +704,21 @@ pub fn add_to_existing(
         }
         (Err(_), Some(e)) => Err(e),
         (Err(e), None) => Err(e.into()),
+    }
+}
+
+/// Progress for copying the kept entries during a compact rebuild: the
+/// first bar shows the percentage, under the pak's name.
+fn compact_progress(target: &Path) -> impl FnMut(u64, u64) -> bool {
+    let mut name = win::wide(&target.to_string_lossy());
+    let mut last = 0;
+    move |done, total| {
+        let pct = (done * 100).checked_div(total).unwrap_or(100);
+        if pct == last {
+            return true;
+        }
+        last = pct;
+        progress::report_percent(&mut name, pct)
     }
 }
 
@@ -735,11 +833,13 @@ pub fn delete_entries(
     target: &Path,
     items: &[String],
     mode: MountPointMode,
+    pack: &PackOptions,
 ) -> Result<ModifyStats, PackError> {
     if modify::has_undo(target) {
         return Err(ModifyError::PendingUndo.into());
     }
-    let info = modify::inspect(target)?;
+    let key = write_key(target, false)?;
+    let info = modify::inspect(target, key.key.as_ref())?;
     let mount = view::Mount::parse(&info.mount);
     let mut selected: Vec<String> = vec![];
     for item in items {
@@ -756,17 +856,37 @@ pub fn delete_entries(
     if selected.is_empty() {
         return Ok(stats);
     }
-    let write_at = choose_write_at(
-        &info,
-        &selected,
-        crate::config::load_options().pack.undo_limit,
-    )?;
-    stats.reused = info.index_offset - write_at.unwrap_or(info.index_offset);
+    if let Some(text) = encrypted_question(&info, &key, false) {
+        if !crate::dialog::confirm(&text) {
+            return Err(PackError::Aborted);
+        }
+    }
+    stats.old_bytes = info.file_len;
     for e in &selected {
         dlog!("  - {e}");
     }
     stats.removed = selected.len();
-    stats.pak_bytes = modify::modify(target, &selected, write_at, |_| Ok(()))?;
+    if pack.compact {
+        let need =
+            info.kept_bytes(&selected) + index_estimate(info.entries.iter().map(|p| p.len()));
+        check_space(
+            target.parent().unwrap_or(Path::new(".")),
+            need,
+            "Rebuilding this pak (Compact)",
+        )?;
+        stats.compacted = true;
+        stats.pak_bytes = modify::rebuild(
+            target,
+            key.key.as_ref(),
+            &selected,
+            &mut compact_progress(target),
+            |_| Ok(()),
+        )?;
+        return Ok(stats);
+    }
+    let write_at = choose_write_at(&info, &selected, pack.undo_limit)?;
+    stats.reused = info.index_offset - write_at.unwrap_or(info.index_offset);
+    stats.pak_bytes = modify::modify(target, key.key.as_ref(), &selected, write_at, |_| Ok(()))?;
     Ok(stats)
 }
 

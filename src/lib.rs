@@ -342,12 +342,14 @@ fn pack_files(
         return match pack::add_to_existing(packed, &plan, mode, opts) {
             Ok(st) => {
                 dlog!(
-                    "  -> OK in {} ms: {} added ({} replaced), {} bytes in, pak now {} bytes{}",
+                    "  -> OK in {} ms: {} added ({} replaced), {} bytes in, pak {} -> {} bytes{}{}",
                     started.elapsed().as_millis(),
                     st.added,
                     st.replaced,
                     st.input_bytes,
+                    st.old_bytes,
                     st.pak_bytes,
+                    if st.compacted { " (rebuilt)" } else { "" },
                     st.new_mount
                         .as_ref()
                         .map(|m| format!(", mount point now {m:?}"))
@@ -436,13 +438,15 @@ pub unsafe extern "system" fn DeleteFilesW(
             describe_list(&items)
         );
         let started = std::time::Instant::now();
-        match pack::delete_entries(&packed, &items, mode) {
+        match pack::delete_entries(&packed, &items, mode, &config::load_options().pack) {
             Ok(st) => {
                 dlog!(
-                    "  -> OK in {} ms: {} entries removed, pak now {} bytes",
+                    "  -> OK in {} ms: {} entries removed, pak {} -> {} bytes{}",
                     started.elapsed().as_millis(),
                     st.removed,
-                    st.pak_bytes
+                    st.old_bytes,
+                    st.pak_bytes,
+                    if st.compacted { " (rebuilt)" } else { "" }
                 );
                 0
             }
