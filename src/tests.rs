@@ -500,8 +500,8 @@ fn mount_folders_are_listed_with_marker_attribute() {
         ["TestGame", "TestGame\\Content"]
     );
     assert!(
-        dirs.iter().all(|l| l.attr == 0x10 | 0x1),
-        "DIRECTORY|READONLY by default"
+        dirs.iter().all(|l| l.attr == 0x10 | 0x2),
+        "DIRECTORY|HIDDEN by default"
     );
     assert!(all
         .iter()
@@ -1099,4 +1099,37 @@ fn modify_refusals() {
         "{slots:?}"
     );
     assert_eq!(read_back(&pak).len(), 3);
+}
+
+#[test]
+fn reroot_question_explains_the_new_folder() {
+    let info = crate::modify::Inspect {
+        mount: "../../../G1R/Config".into(),
+        version: repak::Version::V11,
+        entries: vec!["UserEngine.ini".into()],
+        slots: vec![],
+    };
+    let mount = crate::view::Mount::parse(&info.mount);
+    let plan = pack::plan(
+        Path::new("C:\\src"),
+        Some("G1R"),
+        &["Readme.txt".to_string()],
+        2,
+    )
+    .unwrap();
+    let views: Vec<_> = plan.files.iter().map(|f| f.view.clone()).collect();
+    let mapping = crate::view::map_add(crate::config::MountPointMode::Folder, &mount, &views);
+    let q = pack::reroot_question(&info, &mount, &mapping, &plan);
+    println!("{q}");
+    assert!(q.contains("becomes ../../../G1R"), "{q}");
+    assert!(q.contains("\"Config/\" is added"), "{q}");
+    assert!(
+        q.contains("UserEngine.ini  →  Config/UserEngine.ini"),
+        "{q}"
+    );
+    assert!(
+        q.contains("doesn't change: G1R/Config/UserEngine.ini"),
+        "{q}"
+    );
+    assert!(q.contains("New files go to: G1R/Readme.txt"), "{q}");
 }

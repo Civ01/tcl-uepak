@@ -384,13 +384,8 @@ pub fn add_to_existing(
             ));
         }
     }
-    if let Some(new_mount) = &mapping.new_mount {
-        let text = format!(
-            "These files go outside the pak's mount point {}.\n\n\
-             The mount point will change to {new_mount}. Files already in the pak keep their \
-             game paths; only the pak's index is rewritten, no file data is repacked.\n\nContinue?",
-            info.mount
-        );
+    if mapping.new_mount.is_some() {
+        let text = reroot_question(&info, &mount, &mapping, plan);
         if !crate::dialog::confirm(&text) {
             return Err(PackError::Aborted);
         }
@@ -480,6 +475,64 @@ pub fn add_to_existing(
     })?;
     stats.pak_bytes = pak_bytes;
     Ok(stats)
+}
+
+/// The confirmation shown before widening a pak's mount point: says which
+/// folders get added to the existing entries' paths, with examples.
+pub fn reroot_question(
+    info: &modify::Inspect,
+    mount: &view::Mount,
+    mapping: &view::AddMapping,
+    plan: &Plan,
+) -> String {
+    let new_mount = mapping.new_mount.as_deref().unwrap_or_default();
+    let added = mapping.reroot_prefix.trim_end_matches('/');
+    let game = |visible_len: usize, entry: &str| {
+        let mut parts: Vec<&str> = mount.visible[..visible_len]
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        parts.push(entry);
+        parts.join("/")
+    };
+    let new_len = view::Mount::parse(new_mount).visible.len();
+    let mut text = format!(
+        "These files go outside the pak's mount point {}.\n\n\
+         To fit them, the mount point becomes {new_mount}, and \"{added}/\" is added to the \
+         path of every file already in the pak (it becomes a real folder inside the pak).",
+        info.mount
+    );
+    if let Some(first) = info.entries.first() {
+        text.push_str(&format!(
+            "\n\n  {first}  →  {}{first}",
+            mapping.reroot_prefix
+        ));
+        if info.entries.len() > 1 {
+            text.push_str(&format!("\n  (and {} more)", info.entries.len() - 1));
+        }
+        text.push_str(&format!(
+            "\n\nWhere the game finds them doesn't change: {}",
+            game(mount.visible.len(), first)
+        ));
+    }
+    if let (Some(f), Some(e)) = (plan.files.first(), mapping.entries.first()) {
+        let name = f
+            .source
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "\nNew files go to: {}{}",
+            game(new_len, e),
+            if name.is_empty() || plan.files.len() == 1 {
+                String::new()
+            } else {
+                format!(" (and {} more)", plan.files.len() - 1)
+            }
+        ));
+    }
+    text.push_str("\n\nOnly the pak's index is rewritten; no file data is repacked. Continue?");
+    text
 }
 
 /// Deletes the entries selected by TC's `DeleteList` (F8 inside a pak).

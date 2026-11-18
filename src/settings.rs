@@ -49,8 +49,8 @@ pub const BLOCK_SIZES: [(u32, &str); 5] = [
 ];
 
 pub const ATTRS: [(u32, &str); 5] = [
-    (ATTR_READONLY, "Read-only"),
-    (ATTR_HIDDEN, "Hidden"),
+    (ATTR_HIDDEN, "Hidden (dimmed in TC)"),
+    (ATTR_READONLY, "Read-only (for a colour rule)"),
     (ATTR_SYSTEM, "System"),
     (ATTR_READONLY | ATTR_HIDDEN, "Read-only + Hidden"),
     (0, "None"),

@@ -46,7 +46,7 @@ written to the log.
 
 - `MountPoint=Folder|Root` — show the mount point (without leading `../`) as top-level
   folders (default), or show contents relative to the mount point.
-- `MountFolderAttr=ReadOnly|Hidden|System|None` (combinations allowed) — attributes on the
+- `MountFolderAttr=Hidden|ReadOnly|System|None` (default Hidden; combinations allowed) — attributes on the
   mount point's folders in Folder view, to tell them apart from real folders.
 - `DebugLog=0|1` (also `debug_log`) — detailed diagnostic log in `uepak.log` in the plugin
   folder. If that folder is not writable the log is kept in memory and copied to the

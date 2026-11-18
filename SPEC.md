@@ -160,12 +160,12 @@ A mount point splits into a hidden **base** (leading `../`, `./`, `/` segments) 
 | `Root` | the contents of the mount point | work inside the mount point only |
 
 **Mount folders** (`Folder` mode): each folder of the visible part is listed as an explicit
-directory entry with `DIRECTORY` plus `[Options] MountFolderAttr` (default `ReadOnly`; also
-`Hidden`, `System`, combinations, `None`). Real folders are only implied by file paths and
+directory entry with `DIRECTORY` plus `[Options] MountFolderAttr` (default `Hidden`; also
+`ReadOnly`, `System`, combinations, `None`). Real folders are only implied by file paths and
 carry no attributes. In TC:
-- `ReadOnly`: a colour rule whose search template requires both *Directory* and *Read only*.
-- `Hidden`: TC dims hidden items when hidden files are shown (no rule), but the mount
-  folders disappear when hidden files are not shown.
+- `Hidden` (default, chosen after testing in TC): TC dims hidden items when hidden files are
+  shown (no rule needed), but the mount folders disappear when hidden files are not shown.
+- `ReadOnly`: meant for a colour rule; in TC 11 testing the colour rule didn't pick it up.
 
 Extracting a mount folder creates a plain folder. Names are never decorated (`<…>`): shown
 names travel back into extraction paths and `DeleteList`, and `<` `>` are invalid in file
@@ -246,6 +246,11 @@ moved to `uepak.keys.json.bad`. Keys are plain text (TC's master-password store 
 Alt+F5 does **not** target a pak open in the other panel: TC proposes
 `<target dir>\<source folder>.pak`. To add to an open pak, use F5 into it.
 
+Alt+F5 to a name that already exists **adds to** that pak (TC calls `PackFiles` on the
+existing file, as for its own archivers; it passes nothing that says "overwrite"). So the
+mount-point question can appear there too, when the new files fall outside that pak's mount
+point. To get a fresh pak instead, delete or rename the old one first.
+
 TC passes no per-operation settings to `PackFiles`; the current settings (`uepak.ini
 [Pack]`, edited by the Configure dialog) apply to every pack.
 
@@ -278,12 +283,19 @@ TC passes no per-operation settings to `PackFiles`; the current settings (`uepak
 - Target **inside** *V*: entry path = target minus `V\`. Mount point unchanged.
 - Target **outside** *V* (panel root, an upper mount folder, or beside one such as
   `TheIsle\Plugins`): the visible part becomes the deepest common folder of *V* and all
-  targets. Ask first:
+  targets. Ask first, with concrete examples (first existing entry, first new file):
 
-  > These files go outside the pak's mount point `../../../TheIsle/Content/`.
-  > The mount point will change to `../../../TheIsle/`. Files already in the pak keep
-  > their game paths (`TheIsle/Content/...`); only the pak's index is rewritten, no file
-  > data is repacked. Continue?
+  > These files go outside the pak's mount point ../../../G1R/Config.
+  >
+  > To fit them, the mount point becomes ../../../G1R, and "Config/" is added to the path
+  > of every file already in the pak (it becomes a real folder inside the pak).
+  >
+  >   UserEngine.ini  →  Config/UserEngine.ini
+  >
+  > Where the game finds them doesn't change: G1R/Config/UserEngine.ini
+  > New files go to: G1R/Readme.txt
+  >
+  > Only the pak's index is rewritten; no file data is repacked. Continue?
 
   Yes → prefix every existing entry with the dropped segments, then add the new files.
   No → `E_EABORTED`, nothing written. Cheap because entry paths exist only in the index.
@@ -426,7 +438,7 @@ scaling through dialog units. Tested under Wine by driving the real controls.
 ```ini
 [Options]
 MountPoint=Folder          ; Folder (default) | Root                      [done]
-MountFolderAttr=ReadOnly   ; ReadOnly | Hidden | System | None, combinable [done]
+MountFolderAttr=Hidden     ; Hidden | ReadOnly | System | None, combinable [done]
 DebugLog=0                 ; 1 = uepak.log (§7)                           [done]
 
 [Pack]
@@ -574,14 +586,14 @@ read-only plugin folder (log to clipboard, settings in the `wincmd.ini` folder).
 
 ## 12. Open items
 
-1. **Mount folder marker** (§3.2): which works better in TC, `ReadOnly` + colour rule or
-   `Hidden`? The winner becomes the default.
-2. **Packing in the field:** Oodle packing on Windows, and a plugin-packed mod pak loaded
+1. **Packing in the field:** Oodle packing on Windows, and a plugin-packed mod pak loaded
    by a game.
-3. **TC behaviour of modify flows:** confirm in TC that F5 into a pak / F8 refresh the
-   panel correctly and that the re-root question reads well.
+2. **Alt+F5 onto an existing pak:** keep "add" (TC's model), or offer "replace the pak" in
+   the mount-point question?
 
-Resolved: compact = checkbox; `pluginst.inf` with `file=uepak.wcx64` works; key lookup =
+Resolved: mount folder marker = `Hidden` (tested in TC); F5/F8 refresh the panel
+correctly (tested in TC); plugin output byte-identical to repak with the same mount point
+(tested in TC with the dialog); compact = checkbox; `pluginst.inf` with `file=uepak.wcx64` works; key lookup =
 folder/parent then same non-zero GUID; both view modes with `Folder` default and the mount
 guard; TC argument formats captured; background operations after packing is stable;
 encrypted paks modifiable after a confirmation, no new encrypted paks.

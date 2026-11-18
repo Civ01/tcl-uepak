@@ -225,8 +225,8 @@ pub fn normalize_mount(v: &str) -> String {
 pub struct Options {
     pub mount_point: MountPointMode,
     /// Extra attributes on mount folders in `Folder` view, so TC can show them
-    /// differently: `ReadOnly` (default), `Hidden`, `System`, combinations
-    /// (`ReadOnly,Hidden`) or `None`.
+    /// differently: `Hidden` (default: TC dims hidden items), `ReadOnly`,
+    /// `System`, combinations (`ReadOnly,Hidden`) or `None`.
     pub mount_folder_attr: u32,
     /// `DebugLog=1`: write a diagnostic log (see `log.rs`).
     pub debug_log: bool,
@@ -239,7 +239,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             mount_point: MountPointMode::default(),
-            mount_folder_attr: ATTR_READONLY,
+            mount_folder_attr: ATTR_HIDDEN,
             debug_log: false,
             pack: PackOptions::default(),
             warnings: vec![],
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn parses_mount_folder_attr() {
-        assert_eq!(Options::default().mount_folder_attr, ATTR_READONLY);
+        assert_eq!(Options::default().mount_folder_attr, ATTR_HIDDEN);
         let o = parse_options("[Options]\nMountFolderAttr=Hidden");
         assert_eq!(o.mount_folder_attr, ATTR_HIDDEN);
         let o = parse_options("[Options]\nmount_folder_attr = ReadOnly, System");
