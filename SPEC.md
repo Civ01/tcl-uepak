@@ -414,6 +414,15 @@ new index and footer; the file is truncated to the new end. Existing data is nev
     Checked against a real UE 5.6 pak (decrypted locally) and UnrealPak's test paks,
     which our writer reproduces byte for byte (v7–v11; v5's UnrealPak filled padding with
     arbitrary bytes).
+  - **Checked against UE source** (`PakFileUtilities.cpp`, `UnrealPak.cpp` before 4.21;
+    branches 4.14, 4.16, 4.20–4.22, 4.25–4.27, 5.0, 5.3, 5.6, 5.8):
+    | Rule | Source | Since |
+    |---|---|---|
+    | Compressed blocks: pad `[i] = buf[i % total]` (buf starts at the entry's first block), size = padded total, hash = SHA-1 of the encrypted padded buffer | `CompressFileToWorkingBuffer`, `PrepareCopyCompressedFileToPak` | 4.16 (4.14: random padding bytes) |
+    | Stored data: pad `[i] = buf[(i - size) % size]`, encrypt, hash = SHA-1 of the first `size` encrypted bytes | `PrepareCopyFileToPak` | 4.21 (≤ 4.20: random padding; hash rule unchanged since 4.14) |
+    | Index parts: pad `[i] = buf[i % len]`, SHA-1 of the padded plaintext, then encrypt; path hash index at `IndexOffset + padded primary`, full directory index after the padded path hash index | `FinalizeIndexBlockSize` / `FinalizeIndexBlock` | primary: 4.16; secondary indexes: 4.26 (v10) |
+    | Frozen index (v9, 4.25): zero padding | `MemoryImage` path | 4.25 only; writing v9 frozen paks is refused anyway |
+    Random padding in old UnrealPaks only changes padding bytes; readers ignore them.
 - **[done] Compact when modifying** (`[Pack] Compact=1`, dialog checkbox): builds a
   complete new pak `<pak>.uepak-new` from the kept entries (record + stored bytes copied
   in file order: no recompression, no re-encryption, Oodle entries need no library),
