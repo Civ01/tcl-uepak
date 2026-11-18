@@ -88,6 +88,7 @@ mod imp {
     use windows_sys::Win32::System::WindowsProgramming::FileTimeToDosDateTime;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         MessageBoxW, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TASKMODAL,
+        MB_TOPMOST,
     };
 
     pub fn message(text: &str, is_error: bool) {
@@ -108,8 +109,26 @@ mod imp {
                 std::ptr::null_mut(),
                 text.as_ptr(),
                 caption.as_ptr(),
-                MB_OK | icon | MB_TASKMODAL | MB_SETFOREGROUND,
+                // no owner window: stay above TC's progress window
+                MB_OK | icon | MB_TASKMODAL | MB_SETFOREGROUND | MB_TOPMOST,
             );
+        }
+    }
+
+    /// Removes `bits` from a file's or folder's attributes; true if any were
+    /// set (and are now cleared).
+    pub fn clear_attrs(path: &std::path::Path, bits: u32) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileAttributesW, SetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+        };
+        let w: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        unsafe {
+            let a = GetFileAttributesW(w.as_ptr());
+            if a == INVALID_FILE_ATTRIBUTES || a & bits == 0 {
+                return false;
+            }
+            SetFileAttributesW(w.as_ptr(), a & !bits) != 0
         }
     }
 
@@ -137,11 +156,15 @@ mod imp {
         let text = wide(text);
         let caption = wide(CAPTION);
         unsafe {
+            let owner = GetActiveWindow();
+            // in TC's background threads there is no active window; an
+            // unowned box would otherwise slip behind TC's progress window
+            let top = if owner.is_null() { MB_TOPMOST } else { 0 };
             MessageBoxW(
-                GetActiveWindow(),
+                owner,
                 text.as_ptr(),
                 caption.as_ptr(),
-                MB_YESNO | MB_ICONQUESTION | MB_TASKMODAL | MB_SETFOREGROUND,
+                MB_YESNO | MB_ICONQUESTION | MB_TASKMODAL | MB_SETFOREGROUND | top,
             ) == IDYES
         }
     }
@@ -311,6 +334,10 @@ mod imp {
 
     pub fn ask_yes_no(text: &str) -> bool {
         eprintln!("[{CAPTION}] question (answered No): {text}");
+        false
+    }
+
+    pub fn clear_attrs(_path: &std::path::Path, _bits: u32) -> bool {
         false
     }
 

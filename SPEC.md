@@ -199,7 +199,14 @@ carry no attributes. In TC:
   shown (no rule needed), but the mount folders disappear when hidden files are not shown.
 - `ReadOnly`: meant for a colour rule; in TC 11 testing the colour rule didn't pick it up.
 
-Extracting a mount folder creates a plain folder. Names are never decorated (`<…>`): shown
+Extracting a mount folder creates a plain folder **[done, fixed 2026-11-19]**. TC gives the
+folders it creates the attributes from its *panel listing* (it sets them when it creates
+the folder, before writing files into it), so in TC 11 the marker ended up on the extracted
+folders: they were Hidden on disk. Fix: opened for extraction, the plugin reports mount
+folders as plain directories, and after the first extracted file it removes the marker
+from the mount folders TC just created at the destination. Folders are matched from the
+end of the entry's path (TC drops leading folders when extracting from inside a mount
+folder), and only folders created during this extraction are changed. Names are never decorated (`<…>`): shown
 names travel back into extraction paths and `DeleteList`, and `<` `>` are invalid in file
 names.
 
@@ -621,7 +628,10 @@ several at once.
   another operation…", and opening it meanwhile is refused (`E_EOPEN`). Opening never
   offers to restore the undo file of a change that is still running.
 - **Popups:** a background thread has no window, so dialogs and message boxes have no
-  owner (TC's main window stays usable) and bring themselves to the front. Only one key
+  owner (TC's main window stays usable), bring themselves to the front and stay on top
+  (`HWND_TOPMOST` / `MB_TOPMOST`): without that, clicking TC put its progress window over
+  the prompt, leaving the operation at 0 % with the question hidden (found in TC under
+  Wine, fixed 2026-11-19). Only one key
   dialog shows at a time: operations that wait for it re-check the remembered keys and
   usually find the key just entered.
 - Not covered: two TC instances changing the same pak (the undo file still makes the
@@ -690,6 +700,24 @@ Each change gets fork tests. Offering them upstream is on the backburner (§0).
   (diagnostic log for one file), `UEPAK_PARITY_PAK` (re-pack a reference pak and compare
   bytes), `UEPAK_KEEP_PACKED` (keep written paks for inspection).
 
+**In TC under Wine (2026-11-19)**, with `tools/tc-wine` (keys by virtual-key code, window
+dumps, screenshots, the plugin's debug log), TC 11.58.1 x64 portable:
+
+| Test | Result |
+|---|---|
+| Open pak (mount folders shown Hidden), F5 extract mount folder | ✅ 6 files, background thread. **Bug found:** extracted folders were Hidden on disk → fixed (§3.2), re-tested from the root and from inside a mount folder |
+| Encrypted Oodle pak: wrong key, right key (session only, no keys file) | ✅ |
+| Test archive (Alt+Shift+F9) on the encrypted Oodle pak | ✅ 16 entries, SHA-1 checked, session key reused |
+| Find Files by name with archives | ✅ 75 hits, LIST mode only |
+| Find Files with text in archives | ✅ found in `test_new.pak\Mod\Content\big.txt` |
+| Alt+F5 new pak (None and Oodle) | ✅ Oodle: 46,001 → 66 bytes, extract byte-identical, test ✅ |
+| F5 into an open pak; F8 delete (TC's own confirmation) | ✅ size back to before (space reuse) |
+| Configure from the pack dialog; Compact on → F5 replace with TC's overwrite prompt | ✅ rebuilt, no temp file left |
+| Add to an encrypted pak (confirmation over TC's progress window), compacted | ✅ test 17/17 |
+| Crash recovery: interrupted change, open in TC | ✅ restore prompt, byte-identical |
+| Mount guard: F5 to the root of a pak with a deep mount point, No | ✅ unchanged; Yes on a copy: re-rooted, test 17/17 |
+| Key dialog from the background pack thread (Alt+F5 onto an unopened encrypted pak) | ✅ works; **bug found:** clicking TC hid it behind TC's progress window → fixed (topmost), re-tested with the key dialog and the Yes/No question |
+
 **Manual / tooling:** Python scripts checking the three index SHA-1s of new and modified
 paks and decrypting indexes/blocks of real paks; per-file downloads of UE source
 (`PakFileUtilities.cpp`, `IPlatformFilePak.h`) from the engine fork for format checks.
@@ -750,6 +778,11 @@ a background pack/unpack; read-only plugin folder (log to clipboard, settings in
 | "Move to archive" | `Flags` includes 1 (`MOVE_FILES`) |
 | Alt+F5 with a pak open in the other panel | new name `<dir>\<source folder>.pak`, `SubPath` none |
 | After any `PackFiles` | TC re-opens the pak in list mode to refresh the panel |
+| F5 out of a pak, F5/Alt+F5 into one, test archive | run in TC's background threads (own thread id in the log), with TC's progress window; `DeleteFiles` runs on the UI thread |
+| Extracting folders | TC creates them itself (no `ProcessFile` for directory entries) with the attributes from its panel listing, set at creation |
+| F5 into a pak over existing names | TC asks "Overwrite?" itself before calling `PackFiles` |
+| Plugin returns `E_EABORTED` | TC may show "User abort!" afterwards (sometimes delayed) |
+| Find Files with text in archives | TC opens each pak for extraction and extracts every entry to a temp file through `ProcessFile` |
 | Find Files, name only (with archives) | each pak: `OpenArchive` in list mode, `ReadHeader` to the end, `CloseArchive`; no `ProcessFile` (log of 2026-11-18: 0–9 ms per pak, 2,959 entries in 9 ms) |
 | Configure | `Parent` = TC window handle, `DllInstance` = the plugin's module |
 
@@ -759,14 +792,15 @@ a background pack/unpack; read-only plugin folder (log to clipboard, settings in
 
 Tests only the user can run (in TC or a game); nothing here is waiting on code.
 
-1. **Packing in the field:** Oodle packing on Windows; a plugin-packed mod pak loaded by a
-   game.
+1. **Packing in the field:** a plugin-packed mod pak loaded by a game.
 2. **Encrypted paks in the field:** a game loading a pak the plugin added files to, or
    compacted, with its key.
-3. **Background and search in TC:** a background unpack/pack that needs a key prompt (the
-   dialog comes to the front, TC stays usable); Find Files with text inside a pak.
 
-Resolved: name-only Find Files reads only the index (TC log, §11); key dialog saves by
+Everything else was exercised in a real TC 11.58 under Wine (§10, 2026-11-19).
+
+Resolved: Oodle packing, background operations with key prompts, Find Files by name and
+text, crash recovery, mount guard, Compact, encrypted add — all in TC under Wine (§10);
+name-only Find Files reads only the index (TC log, §11); key dialog saves by
 default with a "session only" choice; Alt+F5 "replace the pak" → backburner; no size
 threshold between in-memory and streaming paths (measured, §10); pak versions 13–15
 don't exist (§3.1); encryption rules match UE source 4.14–5.8 (§4.4); mount folder marker

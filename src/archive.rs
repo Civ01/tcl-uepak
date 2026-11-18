@@ -65,6 +65,13 @@ pub struct Archive {
     pub key_declined: bool,
     /// Attributes for mount folder entries (from options at open time).
     pub mount_folder_attr: u32,
+    /// Extraction: the marker attributes TC copies from the panel listing
+    /// onto the mount folders it creates; removed again after the first
+    /// extracted file (0 = nothing to remove / already done).
+    pub extract_marker: u32,
+    /// When this handle was opened: only folders created after it are
+    /// touched when removing markers.
+    pub opened_at: std::time::SystemTime,
 }
 
 /// Turns `../../../Game/Content/` into `Game\Content` (empty if nothing left).
@@ -168,6 +175,8 @@ impl Archive {
             key: key.copied(),
             key_declined: false,
             mount_folder_attr: options.mount_folder_attr,
+            extract_marker: 0,
+            opened_at: std::time::SystemTime::now(),
         })
     }
 

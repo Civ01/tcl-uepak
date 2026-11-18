@@ -10,6 +10,7 @@ fn wide(s: &str) -> Vec<u16> {
     win::wide(s)
 }
 
+#[derive(Debug)]
 struct Listed {
     name: String,
     pack: u64,
@@ -23,10 +24,14 @@ fn list(path: &Path) -> Result<Vec<Listed>, i32> {
 }
 
 fn list_all(path: &Path) -> Result<Vec<Listed>, i32> {
+    list_mode(path, PK_OM_LIST)
+}
+
+fn list_mode(path: &Path, mode: i32) -> Result<Vec<Listed>, i32> {
     let name = wide(&path.to_string_lossy());
     let mut data = OpenArchiveDataW {
         ArcName: name.as_ptr(),
-        OpenMode: PK_OM_LIST,
+        OpenMode: mode,
         OpenResult: 0,
         CmtBuf: std::ptr::null_mut(),
         CmtBufSize: 0,
@@ -503,6 +508,12 @@ fn mount_folders_are_listed_with_marker_attribute() {
         dirs.iter().all(|l| l.attr == 0x10 | 0x2),
         "DIRECTORY|HIDDEN by default"
     );
+    // opened for extraction (TC applies these attributes to the folders it
+    // creates): plain folders, found in TC under Wine
+    let for_extract = list_mode(&pak, PK_OM_EXTRACT).unwrap();
+    let dirs: Vec<_> = for_extract.iter().filter(|l| l.attr & 0x10 != 0).collect();
+    assert_eq!(dirs.len(), 2);
+    assert!(dirs.iter().all(|l| l.attr == 0x10), "{dirs:?}");
     assert!(all
         .iter()
         .filter(|l| l.attr & 0x10 == 0)

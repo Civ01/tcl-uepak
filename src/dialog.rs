@@ -75,7 +75,6 @@ mod imp {
     const ID_ERROR: u16 = 103;
     const ID_LABEL: u16 = 104;
     const BM_GETCHECK: u32 = 0x00F0;
-    const BM_SETCHECK: u32 = 0x00F1;
     const EM_LIMITTEXT: u32 = 0x00C5;
 
     struct State {
@@ -243,6 +242,11 @@ mod imp {
         match msg {
             WM_INITDIALOG => {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, lp);
+                if GetWindow(hwnd, GW_OWNER).is_null() {
+                    // asked from a background thread: no owner, so keep the
+                    // prompt above TC's progress window
+                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                }
                 let st = &*(lp as *const State);
                 SetDlgItemTextW(hwnd, ID_INFO as i32, st.info.as_ptr());
                 SetDlgItemTextW(hwnd, ID_ERROR as i32, st.error.as_ptr());

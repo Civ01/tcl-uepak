@@ -375,7 +375,14 @@ pub(crate) fn open_impl(name: Option<String>, mode: c_int, result: &mut c_int) -
     offer_undo_restore(&path);
     let started = std::time::Instant::now();
     match open_with_keys(&path, &options) {
-        Ok(arc) => {
+        Ok(mut arc) => {
+            if mode != PK_OM_LIST {
+                // the Hidden/ReadOnly marker is only for the panel. TC still
+                // gives the folders it creates the attributes from its panel
+                // listing, so they are cleaned up after extraction too.
+                arc.extract_marker = arc.mount_folder_attr;
+                arc.mount_folder_attr = 0;
+            }
             remember_view_mode(&path, options.mount_point);
             dlog!(
                 "  opened in {} ms: version={:?} mount={:?} entries={} skipped_unsafe={} compression={:?} encrypted_index={}",
@@ -463,6 +470,53 @@ pub(crate) fn next_header(arc: &mut Archive) -> Option<HeaderOut> {
     })
 }
 
+/// TC creates the mount folders it extracts with the attributes from its
+/// panel listing (the Hidden/ReadOnly marker, SPEC §3.2): seen in TC 11 under
+/// Wine, where the folder is already Hidden when the first file is written.
+/// Removes the marker from those folders, once per extraction, `dest` being
+/// the first extracted file. TC may drop leading folders (extracting from
+/// inside a mount folder), so the folders are matched from the end of the
+/// entry's path; only folders created during this extraction are changed.
+fn clear_mount_markers(arc: &mut Archive, dest: &Path) {
+    let marker = arc.extract_marker;
+    if marker == 0 {
+        return;
+    }
+    arc.extract_marker = 0;
+    let Some(display) = arc.current_item().map(|i| i.display.clone()) else {
+        return;
+    };
+    let mounts: Vec<&str> = arc
+        .items
+        .iter()
+        .filter(|i| i.mount_dir)
+        .map(|i| i.display.as_str())
+        .collect();
+    // entry folders, deepest first, paired with dest's ancestors
+    let comps: Vec<&str> = display.split('\\').collect();
+    let mut folder = dest.parent();
+    for n in (1..comps.len()).rev() {
+        let Some(f) = folder else { break };
+        let prefix = comps[..n].join("\\");
+        let same_name = f
+            .file_name()
+            .is_some_and(|x| x.to_string_lossy().eq_ignore_ascii_case(comps[n - 1]));
+        if !same_name {
+            break; // above the extraction's target folder
+        }
+        let created_now = std::fs::metadata(f)
+            .and_then(|m| m.created())
+            .is_ok_and(|t| t >= arc.opened_at - std::time::Duration::from_secs(2));
+        if mounts.iter().any(|m| m.eq_ignore_ascii_case(&prefix))
+            && created_now
+            && win::clear_attrs(f, marker)
+        {
+            dlog!("  mount folder marker removed: {}", f.display());
+        }
+        folder = f.parent();
+    }
+}
+
 pub(crate) fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) -> c_int {
     if op == PK_SKIP {
         return 0;
@@ -516,7 +570,11 @@ pub(crate) fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) 
         PK_EXTRACT => {
             let Some(dest) = dest else { return E_ECREATE };
             let name = win::wide(&dest.to_string_lossy());
-            arc.extract_current(&dest, |w| progress::Progress { inner: w, name })
+            let r = arc.extract_current(&dest, |w| progress::Progress { inner: w, name });
+            if r.is_ok() {
+                clear_mount_markers(arc, &dest);
+            }
+            r
         }
         _ => return E_NOT_SUPPORTED,
     };
