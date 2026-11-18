@@ -20,7 +20,8 @@ Document status: **v2** (2026-11-17). Markers: **[done]** implemented and tested
 | Settings | Configure dialog (TC's pack dialog / plugin settings) writing `uepak.ini` |
 | Robustness | Panic guard on every export, allocation guards in the fork, path-traversal checks, no partial output files |
 | Diagnostics | `DebugLog`, clipboard fallback, independent footer parser |
-| Tests | 48 automated tests (Windows CI); Wine-driven key and settings dialogs; index-hash verification; byte parity with repak |
+| Large files | Streaming reads and writes (peak memory ~12 MB for 3 GB files), per-block progress/Cancel, free-space check, reuse of space at the end of the pak with an undo-size limit, SHA-1 check in "test" |
+| Tests | 55 automated tests (Windows CI); Wine-driven key and settings dialogs; index-hash verification; byte parity with repak |
 
 ### Roadmap
 
@@ -28,12 +29,11 @@ Document status: **v2** (2026-11-17). Markers: **[done]** implemented and tested
 |---|---|---|---|
 | M1 | ✅ Modify existing paks | F5 into an open pak (add/replace), F8 delete, view-path mapping with the `Folder`-mode mount guard, per-archive mode memory, transactional append with undo file, crash recovery | F6 ✅ |
 | M2 | ✅ Settings dialog | `ConfigurePacker` dialog (§5); compression levels and Oodle compressor | F4 ✅ |
-| **M3** | **Large files** (next) | Streaming writes and block-by-block reads (constant memory, per-block progress), entry SHA-1 check in `PK_TEST` | F5, F7, F9 |
-| M4 | Encrypted modify + compact | Adding to/deleting from encrypted paks (§4.4), "Compact when modifying" rebuild | F10, F6 (copy stored entries) |
+| M3 | ✅ Large files | Streaming writes and block-by-block reads (constant memory, per-block progress), entry SHA-1 check in `PK_TEST`, free-space check, reuse of end-of-pak space with `UndoLimit` | F5, F7, F9 ✅ |
+| **M4** | **Encrypted modify + compact** (next) | Adding to/deleting from encrypted paks (§4.4), "Compact when modifying" rebuild | F10, F6 (copy stored entries) |
 | M5 | Polish | Text search in archives, background operations, v13–15 reading (no samples exist yet) | F8 |
 
-Next: M3 (whole files are still read into memory when packing and decompressed into
-memory when extracting) or M4 (needs M1's machinery, now in place); M5 last.
+Next: M4 (adding to encrypted paks, compact rebuild); M5 last.
 
 ---
 
@@ -183,7 +183,14 @@ same mount-point split (`view.rs`).
 - `PK_TEST`: decompress to nowhere.
 - Errors: create → `E_ECREATE`, write → `E_EWRITE`, decode → `E_BAD_DATA`, missing Oodle →
   warning + `E_NOT_SUPPORTED`, key prompt cancelled → `E_EABORTED`.
-- M3: decompress block by block (constant memory, F7); verify the entry SHA-1 in `PK_TEST` (F9).
+- **[done]** Streaming: entries are read and decompressed one compression block at a time
+  (1 MiB chunks for stored entries; encrypted data decrypted per 16-byte-aligned span),
+  so memory doesn't grow with entry size; progress and Cancel per block.
+- **[done]** `PK_TEST` also checks each entry's SHA-1 (`E_BAD_DATA` if damaged). The hash
+  comes from the record stored before the data (v10+ index entries carry none). Rules,
+  verified on real Unreal paks (UE 4.22 – 5.9, incl. an encrypted one): the hash covers
+  the stored bytes; for encrypted compressed entries, the encrypted bytes including AES
+  padding. Encrypted uncompressed entries aren't checked (no consistent rule found).
 
 ### 3.4 AES keys (reading) **[done]**
 
@@ -198,6 +205,14 @@ extracted is encrypted (asked on first such extraction).
 2. For a non-zero key GUID: any remembered key with that GUID, from any folder; a match is
    saved for this folder too. (A zero GUID identifies nothing: every game's main key has it.)
 3. Otherwise the key dialog.
+
+**Changed key:** if a remembered key matched the pak by its exact non-zero key GUID (step 1
+or 2) but doesn't decrypt it, the key was most likely changed: the game re-encrypted its
+paks with a new key in an update. The dialog then doesn't just say "wrong key"; it opens
+with: *"The key saved for this key GUID doesn't match this pak. The GUID is the same, so
+the pak was most likely re-encrypted with a new key by a game update. Enter the new key.
+(Saved for: <folder>)"*. For a zero GUID (folder match only) it says the game may have been
+updated. **[done]**
 
 **Validation:** the footer stores the SHA-1 of the *decrypted* index (verified on real paks;
 Unreal checks the same). The fork compares it right after decrypting, before any parsing,
@@ -311,20 +326,24 @@ size (§6).
   compression; LZ4/Zstd need V8A+), Oodle library loadable.
 - **[done]** Written to `<pak>.uepak-tmp`, renamed into place at the end: errors and
   Cancel never leave a partial pak.
-- **[done]** Progress reported per file; Cancel → `E_EABORTED`.
+- **[done]** Cancel → `E_EABORTED`.
 - **[done]** Read/write failures → error popup naming the file, then `E_EABORTED` (so TC
   doesn't add a second, vaguer message). Settings problems → warning + `E_NOT_SUPPORTED`.
 - **[done]** Verified: primary index, path-hash index and full-directory index SHA-1s are
   correct (UE checks them on mount), same layout as real UE paks.
-- M3: files are currently read into memory whole; streaming writes (F5) will keep memory
-  flat and report progress per block.
+- **[done]** Files are streamed from disk one block at a time (memory flat for multi-GB
+  inputs); progress and Cancel per block. Output is byte-identical to the in-memory writer.
+- **[done]** Free-space check before writing: if the sources (an upper bound; compression
+  usually shrinks them) plus the index may not fit, ask before starting. If the disk fills
+  anyway, nothing is left behind.
 - **[done]** Byte-identical to repak for the same settings (verified with a repak-made pak;
   `UEPAK_PARITY_PAK` test). Default levels match repak's (Zlib/Gzip 1, Zstd 3, Oodle
   Mermaid/Normal).
 
 ### 4.4 Modifying existing paks **[done]** (encryption and compact: M4)
 
-New/replaced data is written where the old index was, then a new index and footer.
+New/replaced data is written where the old index was (or earlier, see *space reuse*), then a
+new index and footer; the file is truncated to the new end. Existing data is never moved.
 
 - **Kept:** version, mount point (except §4.2.1), path-hash seed, compression slots. The
   `[Pack]` version and mount point are ignored; mismatches are logged.
@@ -347,7 +366,22 @@ New/replaced data is written where the old index was, then a new index and foote
      while an undo file is pending.
   - The file is truncated to the new end after every rewrite (a delete-only change writes
     a smaller index than before).
-- **Dead space** from replaced/deleted data is not tracked; it grows until a compact rebuild.
+- **[done] Space reuse:** replaced and deleted entries are removed before anything is
+  written. If no remaining entry lies after some point before the index (the removed
+  entries were the last ones, or earlier dead space sits there), new data starts at that
+  point instead of at the index. Replacing the file you added last, again and again,
+  doesn't grow the pak; deleting the last files shrinks it. A check refuses to start if
+  any remaining entry would be overwritten.
+- **[done] Undo size limit:** the undo copy covers everything from where writing starts:
+  normally just the index, but with space reuse also the reused data. `[Pack] UndoLimit`
+  (default **1 GB**; `0` = always ask, `unlimited`) caps what is copied without asking.
+  Over the limit, ask: *Yes* = reuse the space (make the big undo copy), *No* = add at the
+  end instead (small undo copy; the pak grows). If even the plain index copy exceeds the
+  limit, ask once more; *No* cancels.
+- **[done] Free-space check:** undo copy + growth of the file (upper bound); ask if it may
+  not fit.
+- **Dead space** elsewhere (not at the end) is not tracked; it stays until a compact
+  rebuild (M4).
 - **M4, encrypted paks:** allowed after a confirmation:
 
   > You are trying to add files to an encrypted pak. The new files and the pak's index
@@ -405,6 +439,7 @@ scaling through dialog units. Tested under Wine by driving the real controls.
 │   Level           [Normal                        ▼]   │
 │   Oodle compressor[Mermaid                       ▼]   │
 │   Block size      [64 KB                         ▼]   │
+│   Undo copy limit [1 GB (default)                ▼]   │
 │   ⚠ (warnings: settings conflicts, Zstd/LZ4, large    │
 │      blocks, Oodle library found / not found)          │
 │                                                       │
@@ -424,6 +459,8 @@ scaling through dialog units. Tested under Wine by driving the real controls.
 - Level choices follow the method (Zlib/Gzip 0–9, Zstd 1–22, Oodle level names, each with
   "Default"); Level / Oodle compressor are disabled for methods that don't use them.
 - Block sizes: 64 KB, 124 KB, 256 KB, 512 KB, 1 MB, plus the current value if it's custom.
+- Undo copy limits: always ask, 256 MB, 1 GB (default), 4 GB, 16 GB, no limit, plus a custom
+  value from the ini.
 - Warnings update live; the Oodle line names the DLL that would be used.
 - OK saves to `uepak.ini` in the settings directory with a small writer that keeps
   comments, order and line endings (instead of `WritePrivateProfileStringW`: same effect,
@@ -448,6 +485,7 @@ Compression=None           ; None | Zlib | Gzip | Oodle | Zstd | LZ4      [done]
 BlockSize=64K              ; bytes, or 64K / 1M                            [done]
 Level=                     ; method-specific, empty = default              [done]
 OodleCompressor=Mermaid    ; Kraken | Mermaid | Selkie | Leviathan | Hydra [done]
+UndoLimit=1G               ; largest undo copy made without asking         [done]
 Compact=0                  ; 1 = full rebuild when modifying               (M4)
 ```
 
@@ -503,11 +541,11 @@ BACKGROUND_PACK`: background-safe popups (key prompt, warnings) and locking arou
 | F2 | `entries()` / `entry()` → `EntryInfo` | ✅ |
 | F3 | v12; `UnsupportedVersion`; probing reports `WrongKey` > `Encrypted` > `UnsupportedVersion`; wrong-key detection by index SHA-1; allocation guards; invalid UTF-16 names don't panic | ✅ |
 | F4 | Writer: configurable block size, store entries that don't shrink, `CompressionOptions` (levels, Oodle compressor/level) | ✅ |
-| F5 | Streaming writes from a `Read`, with progress/cancel callback | M3 |
+| F5 | `PakWriter::write_file_from_reader`: streaming writes from `Read + Seek`, progress/cancel; byte-identical to `write_file` (42 version × method combinations); >4 GB entries | ✅ |
 | F6 | `PakWriter` editing: `remove`, `rename_all`, `set_mount_point`, `set_compression*`, `paths`; `PakReader::index_offset`; new methods fill free footer slots | ✅ (copy stored entries between paks: M4) |
-| F7 | Block-by-block decompression on read | M3 |
+| F7 | Block-by-block reads and decompression; `EntryInfo::data_end`; `PakReader::into_pakwriter_at` (space reuse) | ✅ |
 | F8 | Read v13–15 | M5 |
-| F9 | Entry SHA-1 verification | M3 |
+| F9 | `PakReader::read_file_verified` (entry SHA-1, rules verified on real paks); `HashMismatch`, `Cancelled` errors | ✅ |
 | F10 | AES writing: encrypted index and entries (16-byte padded blocks, AES-256-ECB), key GUID kept | M4 |
 
 Each change gets fork tests; generally useful ones are offered upstream.
@@ -516,7 +554,7 @@ Each change gets fork tests; generally useful ones are offered upstream.
 
 ## 10. Testing
 
-**Automated (48 tests, run on Windows CI on every push):**
+**Automated (55 tests, run on Windows CI on every push):**
 
 - Reading: synthetic round trips for None/Zlib/Gzip/Zstd/LZ4, v12, mount folders and
   attributes, future version refused, non-pak refused, null/bad handles, panic guard,
@@ -532,6 +570,11 @@ Each change gets fork tests; generally useful ones are offered upstream.
   folders / no match, view-mode memory, cancel and read error → byte-identical rollback,
   simulated crash → restore, pending undo refused, encrypted refused, new compression
   slot.
+- Large files / M3: replacing the last file 5× doesn't grow the pak, deleting it shrinks
+  it; undo limit (No → append, Yes → reuse, No/No → unchanged); low free space asks
+  (No → nothing written); `PK_TEST` catches a damaged entry; 40 MB file streams through
+  pack + extract + test (`UEPAK_BIG_MB` for bigger: 3 GB measured at 12 MB peak memory);
+  changed-key message for a stale same-GUID key.
 - Settings: ini writer (comments, order, CRLF, key variants), model ↔ ini round trip,
   shipped ini = defaults, choices and warnings.
 - Options parsing; key parsing (hex/base64); pack planning; view mapping (incl. Unicode).
@@ -543,7 +586,8 @@ Each change gets fork tests; generally useful ones are offered upstream.
 **Manual / tooling:** Wine harnesses that drive the real key dialog and settings dialog;
 Python script checking the three index SHA-1s of new and modified paks.
 
-**Planned:** M3 >4 GB and block-boundary cases.
+Fork tests additionally cover streaming parity at block boundaries (empty, 1 byte, exact
+block, block + 1, incompressible) and a >4 GB entry.
 
 **Real-world samples:**
 

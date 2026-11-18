@@ -11,7 +11,11 @@ Status:
 - **Settings:** the Configure button in TC's pack dialog (or the plugin settings) opens a
   dialog that writes `uepak.ini`.
 
-Next: large-file streaming and adding to encrypted paks (see SPEC.md §0).
+- **Large files:** everything streams block by block (memory stays around 12 MB even for
+  multi-GB files); free-space check; replacing/removing the last files reuses their space,
+  with an undo-size limit (`UndoLimit`, default 1 GB) above which it asks.
+
+Next: adding to encrypted paks and a compact rebuild (see SPEC.md §0).
 
 ## Install
 
