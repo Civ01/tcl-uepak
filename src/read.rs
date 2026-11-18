@@ -76,11 +76,17 @@ pub(crate) fn save_key(folder: &Path, guid: &str, key: &keys::AesKey, persist: b
 /// Opens a pak, resolving an AES key if its index is encrypted: remembered
 /// keys first (SPEC §3.5), then the key prompt until a key matches or the
 /// user cancels.
+/// One key dialog at a time: background operations on several paks of the
+/// same game would otherwise each ask. Whoever waits re-checks the remembered
+/// keys afterwards and usually finds the key just entered.
+static KEY_PROMPT: Mutex<()> = Mutex::new(());
+
 pub(crate) fn open_with_keys(path: &Path, options: &config::Options) -> Result<Archive, OpenError> {
     match Archive::open(path, options, None) {
         Err(OpenError::Encrypted) => {}
         other => return other,
     }
+    let _prompt = KEY_PROMPT.lock().unwrap_or_else(|e| e.into_inner());
     let folder = path.parent().unwrap_or(Path::new("")).to_path_buf();
     let guid = pak_guid(path);
     dlog!("  index encrypted, key guid {guid}; looking for a key");
@@ -168,6 +174,7 @@ pub(crate) fn ensure_entry_key(arc: &mut Archive) -> Result<(), c_int> {
     if arc.key.is_some() {
         return Ok(());
     }
+    let _prompt = KEY_PROMPT.lock().unwrap_or_else(|e| e.into_inner());
     if arc.key_declined {
         return Err(E_EABORTED);
     }
@@ -355,6 +362,13 @@ pub(crate) fn open_impl(name: Option<String>, mode: c_int, result: &mut c_int) -
             Some(f) => dlog!("  footer: {f}"),
             None => dlog!("  footer: no PAK magic in the last 512 bytes"),
         }
+    }
+    if crate::busy::is_busy(&path) {
+        // a background operation is writing it: its index and undo file are
+        // mid-change (never offer a restore now)
+        dlog!("  -> refused: the pak is being changed by another operation");
+        *result = E_EOPEN;
+        return std::ptr::null_mut();
     }
     offer_undo_restore(&path);
     let started = std::time::Instant::now();

@@ -107,6 +107,9 @@ struct KeyFile {
 
 /// Keys entered this TC session (remembered or not).
 static SESSION: Mutex<Vec<KeyRecord>> = Mutex::new(Vec::new());
+/// Serialises read-modify-write of the keys file (background operations can
+/// save keys from several threads at once).
+static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 fn store_path() -> Option<PathBuf> {
     crate::config::settings_dir().map(|d| d.join(KEYS_NAME))
@@ -224,6 +227,7 @@ pub fn remember(folder: &Path, guid: &str, key: &AesKey, persist: bool) -> std::
         return Ok(());
     }
     let path = store_path().ok_or_else(|| std::io::Error::other("no settings directory"))?;
+    let _lock = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut keys = load_file(&path);
     keys.retain(|r| !same(r));
     keys.push(record);

@@ -99,6 +99,9 @@ mod imp {
             const DS_MODALFRAME: u32 = 0x80;
             const DS_FIXEDSYS: u32 = 0x8;
             const DS_CENTER: u32 = 0x800;
+            // background operations run in threads without a window: come
+            // to the front anyway
+            const DS_SETFOREGROUND: u32 = 0x200;
             let mut t = Tpl {
                 buf: vec![],
                 count_at: 0,
@@ -109,6 +112,7 @@ mod imp {
                     | DS_FIXEDSYS
                     | DS_MODALFRAME
                     | DS_CENTER
+                    | DS_SETFOREGROUND
                     | WS_POPUP
                     | WS_CAPTION
                     | WS_SYSMENU,

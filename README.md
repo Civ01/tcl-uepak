@@ -21,7 +21,9 @@ Status:
 - **Compact:** `Compact=1` (or the dialog checkbox) rebuilds the pak on every change: no
   dead space from replaced or deleted files.
 
-Next: text search in archives and background operations (see SPEC.md §0).
+- **Total Commander integration:** Find Files can search text inside paks, and unpacking
+  and packing can run in the background. After updating from an older build, reinstall
+  the plugin once (TC caches what a plugin supports).
 
 ## Install
 

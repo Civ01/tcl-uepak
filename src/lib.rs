@@ -8,6 +8,7 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 pub mod archive;
+mod busy;
 pub mod config;
 pub mod dialog;
 pub mod ffi;
@@ -235,15 +236,27 @@ pub extern "system" fn SetChangeVolProcW(_h: Handle, _proc: ChangeVolProcW) {}
 
 #[no_mangle]
 pub extern "system" fn GetPackerCaps() -> c_int {
-    // NEW/MODIFY/DELETE/OPTIONS are advertised so TC routes Alt+F5, F5-into-pak,
-    // F8 and "Configure" to the plugin; for now those calls are only recorded
-    // (see `report_unimplemented`). TC caches caps: reinstall after changes.
+    // TC caches caps: the plugin must be reinstalled after a change here.
+    // SEARCHTEXT: TC's "Find files" may search text inside pak entries (it
+    // extracts them itself through ProcessFile).
     PK_CAPS_NEW
         | PK_CAPS_MODIFY
         | PK_CAPS_MULTIPLE
         | PK_CAPS_DELETE
         | PK_CAPS_OPTIONS
         | PK_CAPS_BY_CONTENT
+        | PK_CAPS_SEARCHTEXT
+}
+
+pub const BACKGROUND_UNPACK: c_int = 1;
+pub const BACKGROUND_PACK: c_int = 2;
+
+/// Unpacking and packing are thread-safe (SPEC §8.1): per-handle state,
+/// per-thread progress callbacks, locked shared state, and a per-pak busy
+/// guard so two operations never write the same pak.
+#[no_mangle]
+pub extern "system" fn GetBackgroundFlags() -> c_int {
+    BACKGROUND_UNPACK | BACKGROUND_PACK
 }
 
 fn describe_list(items: &[String]) -> String {

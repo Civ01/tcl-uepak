@@ -1702,3 +1702,191 @@ fn real_encrypted_pak_add_and_compact_from_env() {
         crate::keys::clear_session();
     }
 }
+
+// ---------------------------------------------------------------------------
+// M5: background operations, text search
+
+#[test]
+fn capabilities_and_background_flags() {
+    let caps = GetPackerCaps();
+    assert_ne!(caps & PK_CAPS_SEARCHTEXT, 0);
+    assert_eq!(caps & (PK_CAPS_MEMPACK | PK_CAPS_HIDE | PK_CAPS_ENCRYPT), 0);
+    assert_eq!(GetBackgroundFlags(), BACKGROUND_UNPACK | BACKGROUND_PACK);
+}
+
+thread_local! {
+    static PROGRESS_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+unsafe extern "system" fn count_cb(_name: *mut u16, size: i32) -> i32 {
+    if size > 0 {
+        PROGRESS_BYTES.with(|c| c.set(c.get() + size as u64));
+    }
+    1
+}
+
+/// TC's background unpacking: several threads each open, list, extract and
+/// close their own pak at the same time, with their own progress callback.
+#[test]
+fn parallel_extraction_with_per_thread_progress() {
+    let dir = tmp("bg-extract");
+    let paks: Vec<(PathBuf, u64)> = (0..6)
+        .map(|i| {
+            let pak = dir.join(format!("p{i}.pak"));
+            let data = vec![b'a' + i as u8; 200_000 * (i + 1)];
+            let files = [
+                ("Data/file.bin", data),
+                ("Data/small.txt", b"x".repeat(i + 1)),
+            ];
+            make_pak(&pak, Some(repak::Compression::Zlib), &files);
+            (pak, (200_000 * (i + 1) + i + 1) as u64)
+        })
+        .collect();
+    let handles: Vec<_> = paks
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(i, (pak, total))| {
+            let out = dir.join(format!("out{i}"));
+            std::thread::spawn(move || {
+                PROGRESS_BYTES.with(|c| c.set(0));
+                SetProcessDataProcW(std::ptr::null_mut(), Some(count_cb));
+                let got = extract_all(&pak, &out);
+                SetProcessDataProcW(std::ptr::null_mut(), None);
+                let files: Vec<_> = got.iter().filter(|(_, d)| !d.is_empty()).collect();
+                assert_eq!(files.len(), 2, "{i}");
+                assert!(files.iter().any(
+                    |(n, d)| n.ends_with("file.bin") && d.iter().all(|b| *b == b'a' + i as u8)
+                ));
+                // extract + test report every byte: twice the pak's contents
+                assert_eq!(
+                    PROGRESS_BYTES.with(|c| c.get()),
+                    2 * total,
+                    "{i}: own progress only"
+                );
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+/// While one operation writes a pak, others on the same pak are refused (and
+/// opening it never offers to restore the in-flight undo file); different
+/// paks are fine.
+#[test]
+fn busy_pak_is_refused_until_released() {
+    use crate::config::MountPointMode::Root;
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, src) = base_pak("bg-busy");
+    let before = std::fs::read(&pak).unwrap();
+    let plan = pack::plan(&src, None, &["new.txt".to_string()], 2).unwrap();
+    let opts = crate::config::PackOptions::default();
+    {
+        let _held = crate::busy::acquire(&pak).unwrap();
+        assert!(crate::busy::acquire(&pak).is_none());
+        // same pak, other spelling
+        let upper = PathBuf::from(pak.to_string_lossy().to_uppercase());
+        if cfg!(windows) {
+            assert!(crate::busy::is_busy(&upper));
+        }
+        let r = pack::add_to_existing(&pak, &plan, Root, &opts);
+        assert!(matches!(r, Err(pack::PackError::User(_, E_EOPEN))), "{r:?}");
+        let r = pack::delete_entries(&pak, &["Config\\x.ini".to_string()], Root, &opts);
+        assert!(matches!(r, Err(pack::PackError::User(_, E_EOPEN))), "{r:?}");
+        let r = pack::write_new_pak(&pak, &plan, &opts);
+        assert!(matches!(r, Err(pack::PackError::User(_, E_EOPEN))), "{r:?}");
+        // an undo file mid-write: opening is refused, nothing is restored
+        let undo = crate::modify::undo_path(&pak);
+        std::fs::write(&undo, b"in flight").unwrap();
+        confirm_next(&[true]);
+        assert_eq!(list(&pak).err(), Some(E_EOPEN));
+        assert_eq!(
+            crate::dialog::TEST_CONFIRMS.lock().unwrap().len(),
+            1,
+            "no restore question"
+        );
+        std::fs::remove_file(&undo).unwrap();
+        confirm_next(&[]);
+        assert_eq!(std::fs::read(&pak).unwrap(), before);
+        // another pak isn't affected
+        let (other, other_src) = base_pak("bg-busy-other");
+        let p2 = pack::plan(&other_src, None, &["new.txt".to_string()], 2).unwrap();
+        pack::add_to_existing(&other, &p2, Root, &opts).unwrap();
+    }
+    assert!(!crate::busy::is_busy(&pak));
+    pack::add_to_existing(&pak, &plan, Root, &opts).unwrap();
+    assert_eq!(read_back(&pak).len(), 3);
+}
+
+/// Many threads adding to the same pak at once: each either succeeds or is
+/// refused as busy; the pak stays valid and holds every file that was added.
+#[test]
+fn parallel_packing_into_one_pak_never_corrupts_it() {
+    use crate::config::MountPointMode::Root;
+    let dir = tmp("bg-same");
+    let pak = dir.join("same.pak");
+    make_pak(&pak, None, &payload());
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let (pak, src) = (pak.clone(), src.clone());
+            std::thread::spawn(move || {
+                let name = format!("t{i}.bin");
+                std::fs::write(src.join(&name), vec![i as u8; 300_000]).unwrap();
+                let plan = pack::plan(&src, None, std::slice::from_ref(&name), 2).unwrap();
+                let opts = crate::config::PackOptions {
+                    compression: crate::config::PackCompression::Zlib,
+                    ..Default::default()
+                };
+                match pack::add_to_existing(&pak, &plan, Root, &opts) {
+                    Ok(_) => Some(name),
+                    Err(pack::PackError::User(_, E_EOPEN)) => None,
+                    Err(e) => panic!("{i}: {e}"),
+                }
+            })
+        })
+        .collect();
+    let added: Vec<String> = handles
+        .into_iter()
+        .filter_map(|h| h.join().unwrap())
+        .collect();
+    assert!(!added.is_empty());
+    let back = read_back(&pak);
+    assert_eq!(back.len(), payload().len() + added.len());
+    for name in &added {
+        let i: u8 = name[1..name.len() - 4].parse().unwrap();
+        assert!(back
+            .iter()
+            .any(|(n, d)| n == name && *d == vec![i; 300_000]));
+    }
+    assert!(!crate::modify::has_undo(&pak));
+}
+
+/// Keys saved from many threads at once all end up in the keys file.
+#[test]
+fn parallel_key_saves_are_not_lost() {
+    let _g = KEY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::keys::clear_session();
+    let _ = std::fs::remove_file(keys_file());
+    let key = crate::keys::AesKey::parse(TEST_KEY_B64).unwrap();
+    let handles: Vec<_> = (0..16)
+        .map(|i| {
+            std::thread::spawn(move || {
+                let folder = PathBuf::from(format!("C:\\Games\\G{i}\\Paks"));
+                crate::keys::remember(&folder, crate::keys::ZERO_GUID, &key, true).unwrap();
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let text = std::fs::read_to_string(keys_file()).unwrap();
+    for i in 0..16 {
+        assert!(text.contains(&format!("G{i}")), "G{i} saved");
+    }
+    let _ = std::fs::remove_file(keys_file());
+    crate::keys::clear_session();
+}

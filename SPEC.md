@@ -20,8 +20,9 @@ Document status: **v2** (2026-11-17). Markers: **[done]** implemented and tested
 | Settings | Configure dialog (TC's pack dialog / plugin settings) writing `uepak.ini` |
 | Robustness | Panic guard on every export, allocation guards in the fork, path-traversal checks, no partial output files |
 | Diagnostics | `DebugLog`, clipboard fallback, independent footer parser |
+| TC integration | Text search inside paks (Find Files); background unpacking and packing |
 | Large files | Streaming reads and writes (peak memory ~12 MB for 3 GB files), per-block progress/Cancel, free-space check, reuse of space at the end of the pak with an undo-size limit, SHA-1 check in "test" |
-| Tests | 60 automated tests (Windows CI) + 168 in the fork; Wine-driven key and settings dialogs; index-hash verification; byte parity with repak and (encryption, compact copy) with UnrealPak's test paks |
+| Tests | 65 automated tests (Windows CI) + 168 in the fork; Wine-driven key and settings dialogs; index-hash verification; byte parity with repak and (encryption, compact copy) with UnrealPak's test paks |
 
 ### Roadmap
 
@@ -31,9 +32,9 @@ Document status: **v2** (2026-11-17). Markers: **[done]** implemented and tested
 | M2 | ✅ Settings dialog | `ConfigurePacker` dialog (§5); compression levels and Oodle compressor | F4 ✅ |
 | M3 | ✅ Large files | Streaming writes and block-by-block reads (constant memory, per-block progress), entry SHA-1 check in `PK_TEST`, free-space check, reuse of end-of-pak space with `UndoLimit` | F5, F7, F9 ✅ |
 | M4 | ✅ Encrypted modify + compact | Adding to/deleting from encrypted paks (§4.4), "Compact when modifying" rebuild | F10, F6 ✅ |
-| **M5** | **Polish** (next) | Text search in archives, background operations, v13–15 reading (no samples exist yet) | F8 |
+| M5 | ✅ Polish | Text search in archives, background operations; v13–15 dropped (they don't exist in UE) | — |
 
-Next: M5 (text search, background operations, v13–15 reading).
+All planned milestones are done. Remaining: the open items (§12) and the backburner below.
 
 ### Backburner (no milestone)
 
@@ -116,15 +117,19 @@ Files ACLs), hence the write probe. **[done]**
 | `SetChangeVolProcW` | no-op |
 | `CanYouHandleThisFileW` | **[done]** (footer magic in the last 512 bytes) |
 | `PackSetDefaultParams` | **[done]** |
-| `GetPackerCaps` | **[done]** `NEW \| MODIFY \| MULTIPLE \| DELETE \| OPTIONS \| BY_CONTENT` |
+| `GetPackerCaps` | **[done]** `NEW \| MODIFY \| MULTIPLE \| DELETE \| OPTIONS \| BY_CONTENT \| SEARCHTEXT` |
 | `PackFilesW` | **[done]** new and existing paks |
 | `DeleteFilesW` | **[done]** |
 | `ConfigurePacker` | **[done]** settings dialog |
-| `GetBackgroundFlags` | not exported (M5, §8.1) |
+| `GetBackgroundFlags` | **[done]** `BACKGROUND_UNPACK \| BACKGROUND_PACK` (§8.1) |
 | ANSI variants | read functions convert and forward; `PackFiles`/`DeleteFiles` ANSI refuse (TC x64 uses W) |
 
-`PK_CAPS_SEARCHTEXT` is added in M5. Not planned: `PK_CAPS_ENCRYPT`, `PK_CAPS_MEMPACK`,
-`PK_CAPS_HIDE`. TC caches caps: reinstall the plugin when they change.
+**[done]** `PK_CAPS_SEARCHTEXT`: TC's Find Files can search text inside pak entries; TC
+extracts each entry to a temp file through `ProcessFile` itself, so nothing else is
+needed. Encrypted paks ask for their key once (a cancelled prompt isn't repeated right
+away); Oodle paks without the library warn once per pak. Not planned: `PK_CAPS_ENCRYPT`,
+`PK_CAPS_MEMPACK`, `PK_CAPS_HIDE`. TC caches caps: **reinstall the plugin** when they
+change (needed once for M5).
 
 ---
 
@@ -139,7 +144,7 @@ Files ACLs), hence the write probe. **[done]**
 | 9 | 4.25 | supported, except paks with a frozen index |
 | 10–11 | 4.26 – 5.x | supported |
 | 12 `Utf8PakDirectory` | 5.3+ | supported (same layout as 11) |
-| 13 `SortedDirectoryIndex`, 14 `PakchunkIndex`, 15 `EncryptionMethod` | newest | M5, low priority: none seen in the wild (UE 5.8.4 games still ship v11). Reference: CUE4Parse `EPakFileVersion` / `FPakInfo` |
+| 13 and above | — | **don't exist**: UE's `FPakInfo` ends at 12 (`Utf8PakDirectory`) through 5.8 (checked in `IPlatformFilePak.h` on the 5.3/5.6/5.8 branches and Epic's API docs). The "v13–15" planned earlier was a mistake. |
 | unknown / newer | — | refused: "PAK version N is newer than this plugin supports" |
 
 | Compression | Read |
@@ -563,14 +568,29 @@ Compact=0                  ; 1 = full rebuild when modifying               [done
 - **[done]** New paks and extracted files are never left half-written.
 - **[done]** A modified pak is never left half-written (§4.4); a panic during a change
   rolls back too.
-- M5: no modal popups during background operations (§8.1).
+- **[done]** Background operations never write the same pak twice at once (§8.1).
 
-### 8.1 Background operations (M5)
+### 8.1 Background operations **[done]**
 
-`GetBackgroundFlags` is not exported yet, so TC runs everything in the foreground. The
-progress callback is already per-thread. Remaining for `BACKGROUND_UNPACK |
-BACKGROUND_PACK`: background-safe popups (key prompt, warnings) and locking around
-`uepak.keys.json` writes.
+`GetBackgroundFlags` returns `BACKGROUND_UNPACK | BACKGROUND_PACK`: TC may run unpacking
+(`OpenArchive` … `CloseArchive`) and `PackFiles`/`DeleteFiles` in its own threads,
+several at once.
+
+- **Per-operation state:** each open pak lives in its own handle; `PackFiles` keeps
+  everything on the stack; the progress callback is stored per thread.
+- **Shared state** (remembered keys, view modes, "Oodle missing" and "key cancelled"
+  memory, log) is behind locks; saving `uepak.keys.json` is a locked read-modify-write,
+  so keys saved from two threads are both kept.
+- **One writer per pak:** a writer (new pak, add, delete, compact) claims the pak; a second
+  operation on the same pak (any spelling) is refused with "This pak is being changed by
+  another operation…", and opening it meanwhile is refused (`E_EOPEN`). Opening never
+  offers to restore the undo file of a change that is still running.
+- **Popups:** a background thread has no window, so dialogs and message boxes have no
+  owner (TC's main window stays usable) and bring themselves to the front. Only one key
+  dialog shows at a time: operations that wait for it re-check the remembered keys and
+  usually find the key just entered.
+- Not covered: two TC instances changing the same pak (the undo file still makes the
+  second refuse while the first is writing).
 
 ---
 
@@ -585,7 +605,7 @@ BACKGROUND_PACK`: background-safe popups (key prompt, warnings) and locking arou
 | F5 | `PakWriter::write_file_from_reader`: streaming writes from `Read + Seek`, progress/cancel; byte-identical to `write_file` (42 version × method combinations); >4 GB entries | ✅ |
 | F6 | `PakWriter` editing: `remove`, `rename_all`, `set_mount_point`, `set_compression*`, `paths`; `PakReader::index_offset`; new methods fill free footer slots; `PakReader::new_pakwriter_like` + `PakWriter::copy_entry` (compact: stored bytes copied as-is, absolute block offsets moved; rebuilds all 48 UnrealPak test paks byte for byte) | ✅ |
 | F7 | Block-by-block reads and decompression; `EntryInfo::data_end`; `PakReader::into_pakwriter_at` (space reuse) | ✅ |
-| F8 | Read v13–15 | M5 |
+| F8 | ~~Read v13–15~~ | dropped: no such versions exist (§3.1) |
 | F9 | `PakReader::read_file_verified` (entry SHA-1, rules verified on real paks); `HashMismatch`, `Cancelled` errors | ✅ |
 | F10 | AES writing: `set_encrypt_entries` / `set_encrypt_index` / `set_encryption_guid`; padding and hashes as UnrealPak (byte-identical on its test paks); footer keeps the GUID; `read_file_verified` checks encrypted stored entries | ✅ |
 
@@ -595,7 +615,7 @@ Each change gets fork tests; generally useful ones are offered upstream.
 
 ## 10. Testing
 
-**Automated (60 tests, run on Windows CI on every push):**
+**Automated (65 tests, run on Windows CI on every push):**
 
 - Reading: synthetic round trips for None/Zlib/Gzip/Zstd/LZ4, v12, mount folders and
   attributes, future version refused, non-pak refused, null/bad handles, panic guard,
@@ -622,6 +642,10 @@ Each change gets fork tests; generally useful ones are offered upstream.
   key, no question).
 - Compact: no gaps and the index right after the data, smaller than in place, low space
   asks (No → unchanged, no temp file), a failing source leaves the original untouched.
+- Background / M5: caps and background flags; 6 paks extracted in parallel threads, each
+  seeing only its own progress; busy pak refused for add / delete / new / open (no restore
+  question for an in-flight undo file), other paks unaffected; 8 threads adding to one pak
+  (each succeeds or is refused, pak valid with every added file); 16 threads saving keys.
 - Settings: ini writer (comments, order, CRLF, key variants), model ↔ ini round trip,
   shipped ini = defaults, choices and warnings.
 - Options parsing; key parsing (hex/base64); pack planning; view mapping (incl. Unicode).
@@ -693,6 +717,8 @@ read-only plugin folder (log to clipboard, settings in the `wincmd.ini` folder).
 2. **Encrypted paks in the field:** a game loading a pak the plugin added files to (or
    compacted) with its key; and the settings dialog's new Compact checkbox in TC (the Wine
    harness no longer runs in the build sandbox).
+3. **Background and search in TC:** a background unpack/pack with a key prompt (dialog
+   comes to the front, TC stays usable), and Find Files with text inside a pak.
 
 Resolved: Alt+F5 "replace the pak" moved to the backburner (§0); no size threshold
 between in-memory and streaming code paths (measured: no speed difference for small

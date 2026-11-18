@@ -187,6 +187,14 @@ pub fn write_new_pak(
     plan: &Plan,
     opts: &PackOptions,
 ) -> Result<PackStats, PackError> {
+    let _busy = crate::busy::acquire(target).ok_or_else(|| {
+        PackError::User(
+            "This pak is being changed by another operation (running in the background). \
+                 Try again when it has finished."
+                .into(),
+            E_EOPEN,
+        )
+    })?;
     check_settings(opts).map_err(|m| PackError::User(m, E_NOT_SUPPORTED))?;
     check_oodle(opts)?;
     let need = source_bytes(plan) + index_estimate(plan.files.iter().map(|f| f.entry.len()));
@@ -540,6 +548,14 @@ pub fn add_to_existing(
     mode: MountPointMode,
     opts: &PackOptions,
 ) -> Result<ModifyStats, PackError> {
+    let _busy = crate::busy::acquire(target).ok_or_else(|| {
+        PackError::User(
+            "This pak is being changed by another operation (running in the background). \
+                 Try again when it has finished."
+                .into(),
+            E_EOPEN,
+        )
+    })?;
     if modify::has_undo(target) {
         return Err(ModifyError::PendingUndo.into());
     }
@@ -835,6 +851,14 @@ pub fn delete_entries(
     mode: MountPointMode,
     pack: &PackOptions,
 ) -> Result<ModifyStats, PackError> {
+    let _busy = crate::busy::acquire(target).ok_or_else(|| {
+        PackError::User(
+            "This pak is being changed by another operation (running in the background). \
+                 Try again when it has finished."
+                .into(),
+            E_EOPEN,
+        )
+    })?;
     if modify::has_undo(target) {
         return Err(ModifyError::PendingUndo.into());
     }
