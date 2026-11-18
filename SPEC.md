@@ -60,10 +60,7 @@ Housekeeping:
 
 - **Offer fork changes upstream** (trumank/repak). For now all fork work stays on
   `oodle-search-paths` (decision 2026-11-18); `master` is untouched.
-- **Dialog test harness:** the Wine harnesses that drove the key and settings dialogs no
-  longer run in the build sandbox (wineserver aborts on start); dialog changes since M4
-  (Compact checkbox, "session only" checkbox) are checked by tests of the dialog logic,
-  not by driving the real window.
+
 
 ---
 
@@ -509,8 +506,8 @@ instead.
 
 Modal, child of TC's window, built from an in-memory dialog template like the key dialog
 (no resource compiler; the template builder counts its items), `MS Shell Dlg 2`, DPI
-scaling through dialog units. Tested under Wine by driving the real controls up to M3;
-the Compact checkbox (M4) is still to be checked in TC (§12).
+scaling through dialog units. Tested under Wine by driving the real controls and saving
+(incl. the Compact checkbox, 2026-11-18), with a screenshot for the layout.
 
 ```
 ┌ UE PAK plugin settings ───────────────────────────────┐
@@ -696,7 +693,11 @@ Each change gets fork tests. Offering them upstream is on the backburner (§0).
 **Manual / tooling:** Python scripts checking the three index SHA-1s of new and modified
 paks and decrypting indexes/blocks of real paks; per-file downloads of UE source
 (`PakFileUtilities.cpp`, `IPlatformFilePak.h`) from the engine fork for format checks.
-The Wine dialog harnesses (used up to M3) no longer run in the build sandbox.
+Wine harnesses drive the real key dialog (opened from a worker thread, like a
+background operation; "session only" ticked → no keys file, unticked → saved) and the
+settings dialog (every control, warnings, saving). Note: Ubuntu's Wine 9.0 wineserver
+crashes (`free(): invalid pointer`) whenever `TMPDIR` is set, so run it with
+`env -u TMPDIR`.
 
 **Speed, in-memory vs streaming writes** (V11, 64 KB blocks, release build, Linux,
 average of 2 runs; ±10 % is run-to-run noise):
@@ -762,9 +763,7 @@ Tests only the user can run (in TC or a game); nothing here is waiting on code.
    game.
 2. **Encrypted paks in the field:** a game loading a pak the plugin added files to, or
    compacted, with its key.
-3. **Dialogs in TC:** the settings dialog's Compact checkbox (layout and saving) and the
-   key dialog's "Use for this session only" checkbox.
-4. **Background and search in TC:** a background unpack/pack that needs a key prompt (the
+3. **Background and search in TC:** a background unpack/pack that needs a key prompt (the
    dialog comes to the front, TC stays usable); Find Files with text inside a pak.
 
 Resolved: name-only Find Files reads only the index (TC log, §11); key dialog saves by
