@@ -35,6 +35,12 @@ Document status: **v2** (2026-11-17). Markers: **[done]** implemented and tested
 
 Next: M4 (adding to encrypted paks, compact rebuild); M5 last.
 
+### Backburner (no milestone)
+
+- **Alt+F5 onto an existing pak → "Replace the pak":** TC's model is to add to it (current
+  behaviour). An optional third answer in the question could rebuild the pak from only
+  the selected files instead. Revisit after M4 (shares the compact-rebuild code).
+
 ---
 
 ## 1. Goals and non-goals
@@ -586,6 +592,17 @@ Each change gets fork tests; generally useful ones are offered upstream.
 **Manual / tooling:** Wine harnesses that drive the real key dialog and settings dialog;
 Python script checking the three index SHA-1s of new and modified paks.
 
+**Speed, in-memory vs streaming writes** (V11, 64 KB blocks, release build, Linux,
+average of 2 runs; ±10 % is run-to-run noise):
+
+| Files | None | Zlib | LZ4 |
+|---|---|---|---|
+| 2000 × 50 KB | +8 % | −7 % | +5 % |
+| 100 × 1 MB | −4 % | −1 % | −14 % |
+| 5 × 20 MB | −16 % | −6 % | −16 % |
+
+No difference for small files, so only the streaming path is kept (no size threshold).
+
 Fork tests additionally cover streaming parity at block boundaries (empty, 1 byte, exact
 block, block + 1, incompressible) and a >4 GB entry.
 
@@ -632,10 +649,10 @@ read-only plugin folder (log to clipboard, settings in the `wincmd.ini` folder).
 
 1. **Packing in the field:** Oodle packing on Windows, and a plugin-packed mod pak loaded
    by a game.
-2. **Alt+F5 onto an existing pak:** keep "add" (TC's model), or offer "replace the pak" in
-   the mount-point question?
 
-Resolved: mount folder marker = `Hidden` (tested in TC); F5/F8 refresh the panel
+Resolved: Alt+F5 "replace the pak" moved to the backburner (§0); no size threshold
+between in-memory and streaming code paths (measured: no speed difference for small
+files, see §10); mount folder marker = `Hidden` (tested in TC); F5/F8 refresh the panel
 correctly (tested in TC); plugin output byte-identical to repak with the same mount point
 (tested in TC with the dialog); compact = checkbox; `pluginst.inf` with `file=uepak.wcx64` works; key lookup =
 folder/parent then same non-zero GUID; both view modes with `Folder` default and the mount
