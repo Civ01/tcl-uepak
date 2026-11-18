@@ -13,7 +13,9 @@ Features:
   on the next open after a crash), a free-space check, and reuse of space at the end of
   the pak (`UndoLimit`, default 1 GB, caps the undo copy made without asking).
 - **Compact:** `Compact=1` (or the dialog checkbox) rebuilds the pak on every change
-  instead: no dead space from replaced or deleted files.
+  instead: no dead space from replaced or deleted files. Paks under `AutoCompactUnder`
+  (default 10 MB) are always rebuilt; UnrealPak's entry alignment is kept.
+- **Alt+F5 onto an existing pak** asks whether to add to it or replace it.
 - **Encrypted paks:** F5/F8 work after a confirmation, with the key from the key prompt;
   new files and the index are encrypted like the pak's own (same format as UnrealPak).
   New encrypted paks aren't created.
@@ -68,7 +70,8 @@ never written to the log.
   an operation fails.
 
 `[Pack]` (also set by the settings dialog): `MountPoint`, `Version`, `Compression`,
-`Level`, `OodleCompressor`, `BlockSize`, `UndoLimit`, `Compact` — see the comments in
+`Level`, `OodleCompressor`, `BlockSize`, `UndoLimit`, `Compact`, `AutoCompactUnder`;
+ini only: `CompactKeepAlignment` — see the comments in
 `uepak.ini` and SPEC.md §6.
 
 Options are re-read on every operation (no restart needed). The plugin uses `uepak.ini`

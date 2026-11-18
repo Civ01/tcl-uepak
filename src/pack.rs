@@ -646,7 +646,12 @@ pub fn add_to_existing(
             .chain(mapping.entries.iter().map(|e| e.len())),
     );
     let dir = target.parent().unwrap_or(Path::new("."));
-    let write_at = if opts.compact {
+    let (compact, why) = opts.compact_for(info.file_len);
+    dlog!(
+        "  change: {} ({why})",
+        if compact { "rebuild" } else { "in place" }
+    );
+    let write_at = if compact {
         // a complete new pak next to the old one
         let need = info.kept_bytes(&removals) + source_bytes(plan) + index_size;
         check_space(dir, need, "Rebuilding this pak (Compact)")?;
@@ -665,7 +670,7 @@ pub fn add_to_existing(
         new_mount: mapping.new_mount.clone(),
         replaced: removals.len(),
         reused: info.index_offset - write_at.unwrap_or(info.index_offset),
-        compacted: opts.compact,
+        compacted: compact,
         old_bytes: info.file_len,
         ..Default::default()
     };
@@ -702,10 +707,11 @@ pub fn add_to_existing(
         }
         Ok(())
     };
-    let result = if opts.compact {
+    let result = if compact {
         modify::rebuild(
             target,
             key.key.as_ref(),
+            opts.compact_keep_alignment,
             &removals,
             &mut compact_progress(target),
             edit,
@@ -721,6 +727,69 @@ pub fn add_to_existing(
         (Err(_), Some(e)) => Err(e),
         (Err(e), None) => Err(e.into()),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: TC's panel paths (`None` = TC not found).
+    pub static TEST_PANELS: std::cell::RefCell<Option<[String; 2]>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn tc_panel_paths() -> Option<[String; 2]> {
+    #[cfg(test)]
+    return TEST_PANELS.with(|p| p.borrow().clone());
+    #[cfg(not(test))]
+    win::tc_panel_paths()
+}
+
+/// Packing onto an existing pak is either F5 into the pak open in a panel
+/// or Alt+F5 with its name (TC calls PackFiles the same way). Alt+F5 never
+/// targets a pak open in a panel, so: offer "replace the pak" only when TC's
+/// panels can be read, neither shows this pak, and no SubPath was given.
+/// Shortened labels ("…") mean "can't tell": no question (SPEC §4.4).
+pub fn offer_replace(target: &Path, sub_path: Option<&str>) -> bool {
+    if sub_path.is_some_and(|s| !s.is_empty()) {
+        return false;
+    }
+    let Some(panels) = tc_panel_paths() else {
+        dlog!("  TC panels: unknown (no replace question)");
+        return false;
+    };
+    let pak = target.to_string_lossy().to_lowercase();
+    let mut open = false;
+    for p in &panels {
+        let p = p.to_lowercase();
+        if p.contains('…') || p.contains("...") {
+            dlog!("  TC panel path shortened ({p}): no replace question");
+            return false;
+        }
+        if p == pak || p.starts_with(&format!("{pak}\\")) {
+            open = true;
+        }
+    }
+    dlog!("  TC panels: {:?} (pak open in a panel: {open})", panels);
+    !open
+}
+
+/// Text of the Add / Replace / Cancel question.
+pub fn replace_question(target: &Path, opts: &PackOptions, encrypted: bool) -> String {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut t = format!(
+        "{name} already exists.\n\n\
+         Yes: add the files to it (files with the same names are replaced).\n\
+         No: replace the pak: a new pak with only these files, made with your pack settings \
+         ({}, {}, mount point {}).",
+        opts.version, opts.compression, opts.mount_point
+    );
+    if encrypted {
+        t.push_str(" The new pak won't be encrypted.");
+    }
+    t.push_str("\nCancel: do nothing.");
+    t
 }
 
 /// Progress for copying the kept entries during a compact rebuild: the
@@ -890,7 +959,12 @@ pub fn delete_entries(
         dlog!("  - {e}");
     }
     stats.removed = selected.len();
-    if pack.compact {
+    let (compact, why) = pack.compact_for(info.file_len);
+    dlog!(
+        "  change: {} ({why})",
+        if compact { "rebuild" } else { "in place" }
+    );
+    if compact {
         let need =
             info.kept_bytes(&selected) + index_estimate(info.entries.iter().map(|p| p.len()));
         check_space(
@@ -902,6 +976,7 @@ pub fn delete_entries(
         stats.pak_bytes = modify::rebuild(
             target,
             key.key.as_ref(),
+            pack.compact_keep_alignment,
             &selected,
             &mut compact_progress(target),
             |_| Ok(()),

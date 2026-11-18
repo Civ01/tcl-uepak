@@ -45,6 +45,25 @@ pub fn confirm(text: &str) -> bool {
     crate::win::ask_yes_no(text)
 }
 
+#[cfg(test)]
+pub static TEST_CHOICES: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+/// Yes/No/Cancel question: 6 = Yes, 7 = No, 2 = Cancel.
+pub fn choose(text: &str) -> i32 {
+    #[cfg(test)]
+    {
+        TEST_CONFIRM_TEXTS.lock().unwrap().push(text.to_string());
+        let mut q = TEST_CHOICES.lock().unwrap();
+        if q.is_empty() {
+            2
+        } else {
+            q.remove(0)
+        }
+    }
+    #[cfg(not(test))]
+    crate::win::ask_yes_no_cancel(text)
+}
+
 /// Shows the dialog. `None` = cancelled.
 pub fn prompt_key(p: &KeyPrompt) -> Option<KeyAnswer> {
     #[cfg(test)]
@@ -359,6 +378,7 @@ mod settings_ui {
     const ID_INIPATH: u16 = 213;
     const ID_UNDO: u16 = 214;
     const ID_COMPACT: u16 = 215;
+    const ID_AUTOCOMPACT: u16 = 216;
 
     const BUTTON: u16 = 0x80;
     const EDIT: u16 = 0x81;
@@ -386,6 +406,7 @@ mod settings_ui {
         blocks: Vec<(u32, String)>,
         attrs: Vec<(u32, String)>,
         undos: Vec<(u64, String)>,
+        autos: Vec<(u64, String)>,
         oodle: Result<std::path::PathBuf, String>,
         ini: Option<std::path::PathBuf>,
         filling: bool,
@@ -393,7 +414,7 @@ mod settings_ui {
     }
 
     fn template() -> Vec<u32> {
-        let mut t = Tpl::dialog("UE PAK plugin settings", 320, 300);
+        let mut t = Tpl::dialog("UE PAK plugin settings", 320, 316);
         let label =
             |t: &mut Tpl, y: i16, text: &str| t.item(STATIC, 0, 14, y + 2, 84, 9, 0xFFFF, text);
         let combo = CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP;
@@ -403,7 +424,7 @@ mod settings_ui {
             6,
             4,
             308,
-            182,
+            198,
             0xFFFF,
             "Packing (new paks; existing paks keep their version and mount point)",
         );
@@ -440,14 +461,16 @@ mod settings_ui {
             ID_COMPACT,
             "&Compact when changing a pak (rebuild it: no dead space, no undo copy)",
         );
-        t.item(STATIC, SS_NOPREFIX, 14, 152, 292, 32, ID_WARN, "");
-        t.item(BUTTON, BS_GROUPBOX, 6, 190, 308, 72, 0xFFFF, "Browsing");
-        label(&mut t, 204, "Mount point:");
+        label(&mut t, 152, "Auto-compact under:");
+        t.item(COMBO, combo, 100, 152, 206, 100, ID_AUTOCOMPACT, "");
+        t.item(STATIC, SS_NOPREFIX, 14, 168, 292, 32, ID_WARN, "");
+        t.item(BUTTON, BS_GROUPBOX, 6, 206, 308, 72, 0xFFFF, "Browsing");
+        label(&mut t, 220, "Mount point:");
         t.item(
             BUTTON,
             BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
             100,
-            205,
+            221,
             80,
             10,
             ID_VIEW_FOLDER,
@@ -457,37 +480,37 @@ mod settings_ui {
             BUTTON,
             BS_AUTORADIOBUTTON,
             184,
-            205,
+            221,
             80,
             10,
             ID_VIEW_ROOT,
             "as &root",
         );
-        label(&mut t, 221, "Mount folders:");
-        t.item(COMBO, combo | WS_GROUP, 100, 221, 206, 100, ID_ATTR, "");
+        label(&mut t, 237, "Mount folders:");
+        t.item(COMBO, combo | WS_GROUP, 100, 237, 206, 100, ID_ATTR, "");
         t.item(
             BUTTON,
             BS_AUTOCHECKBOX | WS_TABSTOP,
             14,
-            240,
+            256,
             290,
             10,
             ID_DEBUG,
             "Write a &debug log (uepak.log)",
         );
-        t.item(STATIC, SS_NOPREFIX, 6, 266, 308, 9, ID_INIPATH, "");
-        t.item(BUTTON, WS_TABSTOP, 6, 280, 60, 14, ID_DEFAULTS, "&Defaults");
+        t.item(STATIC, SS_NOPREFIX, 6, 282, 308, 9, ID_INIPATH, "");
+        t.item(BUTTON, WS_TABSTOP, 6, 296, 60, 14, ID_DEFAULTS, "&Defaults");
         t.item(
             BUTTON,
             BS_DEFPUSHBUTTON | WS_TABSTOP,
             200,
-            280,
+            296,
             54,
             14,
             1,
             "OK",
         );
-        t.item(BUTTON, WS_TABSTOP, 260, 280, 54, 14, 2, "Cancel");
+        t.item(BUTTON, WS_TABSTOP, 260, 296, 54, 14, 2, "Cancel");
         t.into_dwords()
     }
 
@@ -597,6 +620,18 @@ mod settings_ui {
             &st.undos.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>(),
             ui,
         );
+        st.autos = m.auto_compact_choices();
+        let ai = st
+            .autos
+            .iter()
+            .position(|(u, _)| *u == m.auto_compact_under)
+            .unwrap_or(2);
+        fill(
+            hwnd,
+            ID_AUTOCOMPACT,
+            &st.autos.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>(),
+            ai,
+        );
         st.attrs = m.attr_choices();
         let ai = st
             .attrs
@@ -641,6 +676,9 @@ mod settings_ui {
         }
         if let Some((u, _)) = st.undos.get(sel(hwnd, ID_UNDO)) {
             st.model.undo_limit = *u;
+        }
+        if let Some((u, _)) = st.autos.get(sel(hwnd, ID_AUTOCOMPACT)) {
+            st.model.auto_compact_under = *u;
         }
         if let Some((a, _)) = st.attrs.get(sel(hwnd, ID_ATTR)) {
             st.model.mount_folder_attr = *a;
@@ -736,6 +774,7 @@ mod settings_ui {
             blocks: vec![],
             attrs: vec![],
             undos: vec![],
+            autos: vec![],
             oodle: settings::oodle_status(),
             ini: settings::ini_path(),
             filling: false,

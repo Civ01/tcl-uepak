@@ -1189,6 +1189,7 @@ fn undo_limit_asks_and_falls_back_to_appending() {
     std::fs::write(src.join("Config").join("x.ini"), b"new").unwrap();
     let opts = PackOptions {
         undo_limit: 0,
+        auto_compact_under: 0,
         ..PackOptions::default()
     };
     let items = ["Config\\x.ini".to_string()];
@@ -1469,6 +1470,7 @@ fn adding_to_encrypted_paks_asks_and_encrypts_like_the_pak() {
             let plan = one_file_plan(&format!("m4-add-src-{file}-{compact}"), &data);
             let opts = crate::config::PackOptions {
                 compact,
+                auto_compact_under: 0,
                 ..Default::default()
             };
             // key from the prompt, then "No" to the encryption question
@@ -1608,7 +1610,11 @@ fn compact_rebuild_leaves_no_dead_space() {
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("first.txt"), b"first ".repeat(20_000)).unwrap();
     let plan = pack::plan(&dir.join("src"), None, &["a\\first.txt".to_string()], 2).unwrap();
-    let plain = crate::config::PackOptions::default();
+    // in place (tiny pak: AutoCompactUnder off, or it would compact)
+    let plain = crate::config::PackOptions {
+        auto_compact_under: 0,
+        ..Default::default()
+    };
     pack::add_to_existing(&pak, &plan, Root, &plain).unwrap();
     let grown = std::fs::metadata(&pak).unwrap().len();
     assert!(grown > fresh_size + 100, "{grown} vs {fresh_size}");
@@ -1690,6 +1696,7 @@ fn real_encrypted_pak_add_and_compact_from_env() {
         let plan = one_file_plan(&format!("m4-real-src-{compact}"), &data);
         let opts = crate::config::PackOptions {
             compact,
+            auto_compact_under: 0,
             compression: crate::config::PackCompression::Zlib,
             ..Default::default()
         };
@@ -1934,4 +1941,257 @@ fn guid_match_is_used_without_saving_again() {
     let _ = std::fs::remove_file(keys_file());
     assert_eq!(list(&pak).unwrap().len(), 4);
     crate::keys::clear_session();
+}
+
+/// Find Files over a folder of paks that need the same unknown key: after
+/// one Cancel, the other paks of that folder (same key GUID) don't ask; a
+/// pak in another folder still does.
+#[test]
+fn cancelled_key_prompt_covers_the_whole_folder() {
+    let _g = KEY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::keys::clear_session();
+    let _ = std::fs::remove_file(keys_file());
+    crate::dialog::TEST_ANSWERS.lock().unwrap().clear();
+    super::DECLINED.lock().unwrap().clear();
+    let dir = tmp("decline-folder");
+    let a = dir.join("a.pak");
+    let b = dir.join("b.pak");
+    std::fs::copy(testdata("enc_index.pak"), &a).unwrap();
+    std::fs::copy(testdata("enc_index.pak"), &b).unwrap();
+    answer(None); // Cancel for a.pak
+    assert_eq!(list(&a).err(), Some(E_EABORTED));
+    assert!(crate::dialog::TEST_ANSWERS.lock().unwrap().is_empty());
+    // b.pak: no prompt (an unexpected one would find an empty queue = Cancel,
+    // so check the queue stays untouched with an answer that must survive)
+    answer(Some((TEST_KEY_B64, false)));
+    assert_eq!(list(&b).err(), Some(E_EABORTED));
+    assert_eq!(
+        crate::dialog::TEST_ANSWERS.lock().unwrap().len(),
+        1,
+        "b.pak didn't ask"
+    );
+    // another folder asks (and takes the queued key)
+    let other = copy_to_tmp("decline-other", &testdata("enc_index.pak"));
+    assert_eq!(list(&other).unwrap().len(), 4);
+    assert!(crate::dialog::TEST_ANSWERS.lock().unwrap().is_empty());
+    super::DECLINED.lock().unwrap().clear();
+    crate::keys::clear_session();
+}
+
+#[test]
+fn auto_compact_under_overrides_compact_for_small_paks() {
+    use crate::config::MountPointMode::Root;
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, src) = base_pak("auto-compact");
+    let size = std::fs::metadata(&pak).unwrap().len();
+    let plan = pack::plan(&src, None, &["new.txt".to_string()], 2).unwrap();
+    // under the limit: rebuilt although Compact=0
+    let small = crate::config::PackOptions {
+        compact: false,
+        auto_compact_under: size + 1,
+        ..Default::default()
+    };
+    let st = pack::add_to_existing(&pak, &plan, Root, &small).unwrap();
+    assert!(st.compacted);
+    assert_no_dead_space(&pak);
+    // limit below the pak's size: Compact (off) decides -> in place
+    let size = std::fs::metadata(&pak).unwrap().len();
+    let big = crate::config::PackOptions {
+        compact: false,
+        auto_compact_under: size,
+        ..Default::default()
+    };
+    let st = pack::add_to_existing(&pak, &plan, Root, &big).unwrap();
+    assert!(!st.compacted);
+    // ... and Compact=1 above the limit still rebuilds
+    let both = crate::config::PackOptions {
+        compact: true,
+        auto_compact_under: 1,
+        ..Default::default()
+    };
+    assert!(
+        pack::add_to_existing(&pak, &plan, Root, &both)
+            .unwrap()
+            .compacted
+    );
+    // deleting follows the same rule
+    let roomy = crate::config::PackOptions {
+        compact: false,
+        auto_compact_under: 1 << 30,
+        ..Default::default()
+    };
+    let st = pack::delete_entries(&pak, &["new.txt".to_string()], Root, &roomy).unwrap();
+    assert!(st.compacted);
+    assert_no_dead_space(&pak);
+}
+
+fn set_panels(p: Option<[&str; 2]>) {
+    pack::TEST_PANELS.with(|c| *c.borrow_mut() = p.map(|[a, b]| [a.to_string(), b.to_string()]));
+}
+
+/// Alt+F5 onto an existing pak (not open in a TC panel): Add / Replace /
+/// Cancel. F5 into a pak open in a panel never asks.
+#[test]
+fn alt_f5_onto_existing_pak_offers_replace() {
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, src) = base_pak("replace-choice");
+    let before = read_back(&pak);
+    let add = ["new.txt".to_string()];
+    let opts = crate::config::PackOptions::default();
+    let panels_elsewhere = Some(["z:\\elsewhere\\*.*", "c:\\games\\*.*"]);
+    let texts = || {
+        // keep only the add/replace questions (mount-point questions are
+        // answered Yes below)
+        std::mem::take(&mut *crate::dialog::TEST_CONFIRM_TEXTS.lock().unwrap())
+            .into_iter()
+            .filter(|t| t.contains("already exists"))
+            .collect::<Vec<_>>()
+    };
+    texts();
+    confirm_next(&[true; 12]);
+
+    // Cancel: unchanged
+    set_panels(panels_elsewhere);
+    crate::dialog::TEST_CHOICES.lock().unwrap().push(2);
+    let bytes = std::fs::read(&pak).unwrap();
+    assert_eq!(
+        crate::pack_files(&pak, None, &src, &add, 2, &opts),
+        E_EABORTED
+    );
+    assert_eq!(std::fs::read(&pak).unwrap(), bytes);
+    let q = texts();
+    assert!(
+        q[0].contains("base.pak already exists") && q[0].contains("No: replace the pak"),
+        "{q:?}"
+    );
+
+    // Yes: add (as before)
+    crate::dialog::TEST_CHOICES.lock().unwrap().push(6);
+    assert_eq!(crate::pack_files(&pak, None, &src, &add, 2, &opts), 0);
+    assert_eq!(read_back(&pak).len(), before.len() + 1);
+
+    // No: replace -> only the new file
+    crate::dialog::TEST_CHOICES.lock().unwrap().push(7);
+    assert_eq!(crate::pack_files(&pak, None, &src, &add, 2, &opts), 0);
+    let now = read_back(&pak);
+    assert_eq!(now.len(), 1);
+    assert_eq!(now[0].0, "new.txt");
+    texts();
+
+    // pak open in a panel (F5 into it), SubPath given, shortened label, TC
+    // not found: no question, files added
+    let shown = format!("{}\\*.*", pak.to_string_lossy().to_uppercase());
+    for (panels, sub) in [
+        (Some(["z:\\elsewhere\\*.*", shown.as_str()]), None),
+        (panels_elsewhere, Some("Config")),
+        (Some(["z:\\…\\deep\\*.*", "c:\\games\\*.*"]), None),
+        (None, None),
+    ] {
+        set_panels(panels);
+        let n = read_back(&pak).len();
+        assert_eq!(crate::pack_files(&pak, sub, &src, &add, 2, &opts), 0);
+        assert!(texts().is_empty(), "{panels:?} {sub:?}");
+        assert!(read_back(&pak).len() >= n);
+    }
+    set_panels(None);
+    assert!(crate::dialog::TEST_CHOICES.lock().unwrap().is_empty());
+    crate::dialog::TEST_CONFIRMS.lock().unwrap().clear();
+}
+
+#[test]
+fn alignment_detection() {
+    use crate::modify::detect_alignment;
+    let e = |o: u64, end: u64, p: &str| (o, end, p.to_string());
+    // packed back to back: nothing aligned
+    assert_eq!(detect_alignment(&[e(0, 100, "a"), e(100, 300, "b")]), None);
+    // gaps before 1 MB and 2 MB boundaries -> 1 MB, both entries
+    let found = detect_alignment(&[
+        e(0, 900_000, "a"),
+        e(1 << 20, (1 << 20) + 500, "b"),
+        e((1 << 20) + 500, 1_900_000, "c"),
+        e(2 << 20, (2 << 20) + 10, "d"),
+    ])
+    .unwrap();
+    assert_eq!(found.0, 1 << 20);
+    assert_eq!(found.1, ["b", "d"]);
+    // a gap before an odd offset (dead space) isn't alignment
+    assert_eq!(
+        detect_alignment(&[e(0, 100, "a"), e(5000, 6000, "b")]),
+        None
+    );
+}
+
+/// Compacting keeps UnrealPak's alignment (default) or drops it
+/// (`CompactKeepAlignment=0`).
+#[test]
+fn compact_keeps_alignment_unless_disabled() {
+    use crate::config::MountPointMode::Root;
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    for keep in [true, false] {
+        let dir = tmp(&format!("align-{keep}"));
+        let pak = dir.join("a.pak");
+        let mut w = repak::PakBuilder::new().writer(
+            std::io::BufWriter::new(std::fs::File::create(&pak).unwrap()),
+            repak::Version::V11,
+            "../../../G/".into(),
+            Some(7),
+        );
+        w.write_file("first.bin", false, vec![1u8; 70_000]).unwrap();
+        w.write_file("small.bin", false, vec![2u8; 3_000]).unwrap();
+        w.align_to(65536).unwrap();
+        w.write_file("aligned.bin", false, vec![3u8; 50_000])
+            .unwrap();
+        w.write_index().unwrap();
+        let opts = crate::config::PackOptions {
+            compact: true,
+            compact_keep_alignment: keep,
+            ..Default::default()
+        };
+        pack::delete_entries(&pak, &["first.bin".to_string()], Root, &opts).unwrap();
+        let mut f = std::io::BufReader::new(std::fs::File::open(&pak).unwrap());
+        let r = repak::PakBuilder::new().reader(&mut f).unwrap();
+        let off = r
+            .entries()
+            .find(|(p, _)| *p == "aligned.bin")
+            .unwrap()
+            .1
+            .offset;
+        assert_eq!(off % 65536 == 0, keep, "keep={keep} offset={off}");
+        assert_eq!(read_back(&pak).len(), 2);
+    }
+}
+
+/// Another process (here: the test, through its own file handle) holding
+/// the pak's lock file: writers are refused and opening is refused; once
+/// released everything works; a stale, unlocked lock file blocks nothing.
+#[test]
+fn other_process_lock_blocks_writers_and_opening() {
+    use crate::config::MountPointMode::Root;
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, src) = base_pak("xproc-lock");
+    let plan = pack::plan(&src, None, &["new.txt".to_string()], 2).unwrap();
+    let opts = crate::config::PackOptions::default();
+    let lock = crate::busy::lock_path(&pak);
+    let other = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock)
+        .unwrap();
+    other.try_lock().unwrap();
+    let before = std::fs::read(&pak).unwrap();
+    let r = pack::add_to_existing(&pak, &plan, Root, &opts);
+    assert!(matches!(r, Err(pack::PackError::User(_, E_EOPEN))), "{r:?}");
+    let r = pack::delete_entries(&pak, &["new.txt".to_string()], Root, &opts);
+    assert!(matches!(r, Err(pack::PackError::User(_, E_EOPEN))), "{r:?}");
+    assert_eq!(list(&pak).err(), Some(E_EOPEN));
+    assert_eq!(std::fs::read(&pak).unwrap(), before);
+    // released, file left behind (as after a crash): no effect, cleaned up
+    other.unlock().unwrap();
+    drop(other);
+    assert!(lock.exists());
+    assert!(list(&pak).is_ok());
+    assert!(!lock.exists(), "stale lock file removed");
+    pack::add_to_existing(&pak, &plan, Root, &opts).unwrap();
+    assert!(!lock.exists(), "lock file removed after writing");
 }

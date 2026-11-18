@@ -1,3 +1,4 @@
 /target
 /package
 *.zip
+tools/tc-wine/wkeys/target/

@@ -28,7 +28,6 @@ mod tests;
 use archive::Archive;
 use ffi::*;
 use read::*;
-use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -343,7 +342,31 @@ fn pack_files(
             return E_EABORTED;
         }
     };
-    if packed.exists() {
+    let mut replacing = false;
+    if packed.exists() && pack::offer_replace(packed, sub) {
+        let encrypted = archive::sniff_footer(packed)
+            .and_then(|f| f.encrypted_index)
+            .unwrap_or(false);
+        match dialog::choose(&pack::replace_question(packed, opts, encrypted)) {
+            6 => dlog!("  existing pak not open in a panel (Alt+F5): add to it"),
+            7 => {
+                dlog!("  existing pak not open in a panel (Alt+F5): replace it");
+                if modify::has_undo(packed) {
+                    return report_pack_error(
+                        packed,
+                        modify::ModifyError::PendingUndo.into(),
+                        "The pak was left unchanged.",
+                    );
+                }
+                replacing = true;
+            }
+            _ => {
+                dlog!("  -> cancelled at the add/replace question");
+                return E_EABORTED;
+            }
+        }
+    }
+    if packed.exists() && !replacing {
         let mode = read::view_mode_for(packed, options_view_mode());
         dlog!(
             "  existing pak: view={mode:?} compression={:?} level={:?} files={}",

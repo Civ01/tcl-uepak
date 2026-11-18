@@ -23,7 +23,7 @@ everything not yet built is listed in the backburner (§0) or the open items (§
 | Diagnostics | `DebugLog`, clipboard fallback, independent footer parser |
 | TC integration | Text search inside paks (Find Files); background unpacking and packing |
 | Large files | Streaming reads and writes (peak memory ~12 MB for 3 GB files), per-block progress/Cancel, free-space check, reuse of space at the end of the pak with an undo-size limit, SHA-1 check in "test" |
-| Tests | 66 automated tests (Windows CI) + 171 in the fork; index-hash verification; byte parity with repak and (encryption, compact copy) with UnrealPak's test paks; encryption rules checked against UE source 4.14–5.8 |
+| Tests | 72 automated tests (Windows CI) + 171 in the fork; index-hash verification; byte parity with repak and (encryption, compact copy) with UnrealPak's test paks; encryption rules checked against UE source 4.14–5.8 |
 
 ### Roadmap
 
@@ -42,19 +42,13 @@ and the backburner below.
 
 Features:
 
-- **Alt+F5 onto an existing pak → "Replace the pak":** TC's model is to add to it (current
-  behaviour). An optional answer could rebuild the pak from only the selected files
-  instead. Unblocked since M4 (reuses the compact rebuild).
-- **Fewer popups during Find Files over many paks:** the missing-Oodle warning shows once
-  per pak (could be once per TC session); a cancelled key prompt is remembered for 10 s
-  per pak (could be per folder for the rest of a search). Name-only searches read just the
-  index (confirmed with a TC log, §11), so only popups can slow them down.
-- **Keep alignment when compacting:** compacting drops the 1–2 MB alignment UnrealPak may
-  add (§4.4); an option could keep it, should a platform need it.
 - **Keys protected by TC's master password** (`PkSetCryptCallback`) instead of plain text
   in `uepak.keys.json`.
 - **Reading v1 paks** and **v9 paks with a frozen index** (no samples of either).
-- **Two TC instances changing the same pak:** the busy guard is per process (§8.1).
+
+Done from this list (2026-11-19): Alt+F5 "replace the pak" (§4.1), fewer popups in Find
+Files (§3.4, §3.3), keep alignment when compacting and `AutoCompactUnder` (§4.4), two TC
+instances (§8.1).
 
 Housekeeping:
 
@@ -149,7 +143,7 @@ Files ACLs), hence the write probe. **[done]**
 extracts each entry to a temp file through `ProcessFile` itself, so nothing else is
 needed. Name-only searches open each pak in list mode and read only its index (§11).
 Encrypted paks ask for their key once (a cancelled prompt isn't repeated right away);
-Oodle paks without the library warn once per pak (see the backburner). Not planned:
+Oodle paks without the library warn once per TC session. Not planned:
 `PK_CAPS_ENCRYPT`, `PK_CAPS_MEMPACK`, `PK_CAPS_HIDE`. TC caches caps: **reinstall the
 plugin** when they change (needed once for M5).
 
@@ -221,7 +215,8 @@ same mount-point split (`view.rs`).
   `E_EABORTED`. A partial file is deleted on any failure.
 - `PK_TEST`: decompress to nowhere.
 - Errors: create → `E_ECREATE`, write → `E_EWRITE`, decode → `E_BAD_DATA`, missing Oodle →
-  warning + `E_NOT_SUPPORTED`, key prompt cancelled → `E_EABORTED`.
+  warning (once per TC session: the library is missing for every pak alike) +
+  `E_NOT_SUPPORTED`, key prompt cancelled → `E_EABORTED`.
 - **[done]** Streaming: entries are read and decompressed one compression block at a time
   (1 MiB chunks for stored entries; encrypted data decrypted per 16-byte-aligned span),
   so memory doesn't grow with entry size; progress and Cancel per block.
@@ -269,8 +264,11 @@ or base64 of 32 bytes; repeats with an error line on a bad format or wrong key;
 a checkbox **"Use for this session only (don't save it to uepak.keys.json)"**, unticked by
 default: unticked, the key is saved for the pak's folder and its subfolders; ticked, it is
 only kept until TC exits (e.g. paks copied into a scratch folder for testing). The keys
-file is only ever written from this dialog. Cancel → `E_EABORTED` and no new prompt for
-the same pak for 10 s (TC opens a pak several times per operation). Every working key is
+file is only ever written from this dialog. Cancel → `E_EABORTED`, and no new prompt for
+**any pak in the same folder needing the same key GUID** until 10 s after the last pak
+that would have asked: TC opens a pak several times per operation, and Find Files opens
+every pak of a folder, so one Cancel covers the whole search. A pak in another folder
+still asks. **[done 2026-11-19]** Every working key is
 kept in a session cache until TC exits. Only one key dialog shows at a time (§8.1).
 
 **Storage:** `uepak.keys.json` in the settings directory:
@@ -300,7 +298,7 @@ protection: backburner) and are never written to the log.
 | TC action | Plugin call | Status |
 |---|---|---|
 | Alt+F5 to a new `.pak` | `PackFilesW`, file doesn't exist | **[done]** |
-| Alt+F5 with an existing pak's name typed in | `PackFilesW`, file exists | **[done]**, always at the pak's root |
+| Alt+F5 with an existing pak's name typed in | `PackFilesW`, file exists | **[done]**: Add / Replace / Cancel question (below); adding is always at the pak's root |
 | F5 into an open pak | `PackFilesW`, file exists, `SubPath` = current folder | **[done]** |
 | F8 inside an open pak | `DeleteFilesW` | **[done]** |
 | "Configure" in the Alt+F5 dialog | `ConfigurePacker` | **[done]** |
@@ -308,10 +306,24 @@ protection: backburner) and are never written to the log.
 Alt+F5 does **not** target a pak open in the other panel: TC proposes
 `<target dir>\<source folder>.pak`. To add to an open pak, use F5 into it.
 
-Alt+F5 to a name that already exists **adds to** that pak (TC calls `PackFiles` on the
-existing file, as for its own archivers; it passes nothing that says "overwrite"). So the
-mount-point question can appear there too, when the new files fall outside that pak's mount
-point. To get a fresh pak instead, delete or rename the old one first.
+**Alt+F5 onto an existing pak: Add or Replace [done 2026-11-19].** TC calls `PackFiles`
+exactly the same way for F5 into an open pak and for Alt+F5 with an existing pak's name
+(same arguments, same list-then-pack sequence in the log). What differs: F5 needs the pak
+open in a panel, and Alt+F5 never targets a pak open in a panel. So the plugin asks TC's
+main window for its two panel paths (`WM_USER+50`, 9/10 = path labels, read with
+`SendMessageTimeout`, 500 ms) and, when no `SubPath` is given and neither panel shows the
+pak, asks:
+
+> x.pak already exists.
+> Yes: add the files to it (files with the same names are replaced).
+> No: replace the pak: a new pak with only these files, made with your pack settings
+> (V11, None, mount point ../../../). [The new pak won't be encrypted.]
+> Cancel: do nothing.
+
+Yes = add (as before; the mount-point question may follow when the files fall outside the
+pak's mount point). No = a new pak written like any new one (temp file, then renamed over
+the old pak; refused while an undo file is pending). When TC's window can't be asked, or a
+panel's path label is shortened ("…"), the plugin can't tell and adds without asking.
 
 TC passes no per-operation settings to `PackFiles`; the current settings (`uepak.ini
 [Pack]`, edited by the Configure dialog) apply to every pack.
@@ -475,9 +487,18 @@ instead.
   original is untouched until the final rename, and any failure or Cancel only deletes
   the new file. Progress: the first bar shows the copy percentage. Free-space check: the
   whole new pak. Applies to F5 into a pak and F8.
-  - Compacting also drops alignment padding UnrealPak may have added (the UE 5.6 sample
-    shrank from 9.16 to 8.19 MB: some entries started at 1–2 MB boundaries). Offsets in the
-    index are what games use, so this is safe on PC.
+  - **[done] Keep alignment** (`[Pack] CompactKeepAlignment=1`, default; ini only):
+    UnrealPak can start entries on a boundary (1–2 MB in the UE 5.6 sample) with zero
+    padding before them. An entry counts as aligned when there is a gap before it and its
+    offset is a multiple of at least 4 KB; the pak's alignment is the smallest such
+    boundary. Those entries are placed on that boundary again (zero padding, fork
+    `PakWriter::align_to`). New files aren't aligned (UE's rule for which files it aligns
+    isn't stored in the pak). With 0, entries are packed tightly: the 5.6 sample shrinks
+    from 9.16 to 8.19 MB; offsets in the index are what games use, so that is safe on PC.
+- **[done] Auto-compact small paks** (`[Pack] AutoCompactUnder`, default **10 MB**, 0 = off;
+  dialog combo: Off, 1 MB, 10 MB, 100 MB, 1 GB): a pak smaller than this is always rebuilt
+  when changed, whatever `Compact` says (rebuilding is cheap for small paks). Larger paks
+  follow `Compact`. The log says which applied ("change: rebuild (AutoCompactUnder)").
 
 ### 4.5 Deleting **[done]**
 
@@ -528,6 +549,7 @@ scaling through dialog units. Tested under Wine by driving the real controls and
 │   Undo copy limit [1 GB (default)                ▼]   │
 │   [ ] Compact when changing a pak (rebuild it: no     │
 │       dead space, no undo copy)                       │
+│   Auto-compact under [10 MB (default)            ▼]   │
 │   ⚠ (warnings: settings conflicts, Zstd/LZ4, large    │
 │      blocks, Oodle library found / not found)          │
 │                                                       │
@@ -549,6 +571,8 @@ scaling through dialog units. Tested under Wine by driving the real controls and
 - Block sizes: 64 KB, 124 KB, 256 KB, 512 KB, 1 MB, plus the current value if it's custom.
 - Undo copy limits: always ask, 256 MB, 1 GB (default), 4 GB, 16 GB, no limit, plus a custom
   value from the ini.
+- Auto-compact under: Off, 1 MB, 10 MB (default), 100 MB, 1 GB, plus a custom value from
+  the ini.
 - Warnings update live; the Oodle line names the DLL that would be used.
 - OK saves to `uepak.ini` in the settings directory with a small writer that keeps
   comments, order and line endings (instead of `WritePrivateProfileStringW`: same effect,
@@ -573,6 +597,8 @@ BlockSize=64K              ; bytes, or 64K / 1M                            [done
 Level=                     ; method-specific, empty = default              [done]
 OodleCompressor=Mermaid    ; Kraken | Mermaid | Selkie | Leviathan | Hydra [done]
 UndoLimit=1G               ; largest undo copy made without asking         [done]
+AutoCompactUnder=10M       ; smaller paks are always rebuilt when changed   [done]
+CompactKeepAlignment=1     ; rebuild keeps UnrealPak's entry alignment      [done]
 Compact=0                  ; 1 = full rebuild when modifying               [done]
 ```
 
@@ -634,8 +660,11 @@ several at once.
   Wine, fixed 2026-11-19). Only one key
   dialog shows at a time: operations that wait for it re-check the remembered keys and
   usually find the key just entered.
-- Not covered: two TC instances changing the same pak (the undo file still makes the
-  second refuse while the first is writing).
+- **Other processes [done 2026-11-19]:** a writer also holds an OS lock on
+  `<pak>.uepak-lock` (`File::try_lock`, LockFileEx on Windows). Another TC instance's
+  writer gets the same "being changed by another operation" refusal, and its open is
+  refused while the lock is held. The OS releases the lock if TC crashes; a leftover,
+  unlocked lock file is ignored and removed.
 
 ---
 
@@ -660,7 +689,7 @@ Each change gets fork tests. Offering them upstream is on the backburner (§0).
 
 ## 10. Testing
 
-**Automated (66 tests, run on Windows CI on every push):**
+**Automated (72 tests, run on Windows CI on every push):**
 
 - Reading: synthetic round trips for None/Zlib/Gzip/Zstd/LZ4, v12, mount folders and
   attributes, future version refused, non-pak refused, null/bad handles, panic guard,
@@ -692,6 +721,12 @@ Each change gets fork tests. Offering them upstream is on the backburner (§0).
   seeing only its own progress; busy pak refused for add / delete / new / open (no restore
   question for an in-flight undo file), other paks unaffected; 8 threads adding to one pak
   (each succeeds or is refused, pak valid with every added file); 16 threads saving keys.
+- 2026-11-19 additions: Add / Replace / Cancel for packing onto an existing pak that no
+  panel shows (and no question when a panel shows it, with a SubPath, a shortened label or
+  no TC window); one Cancel covers the other paks of the folder; AutoCompactUnder
+  overrides Compact for small paks (add and delete); alignment detection; compact keeps
+  alignment or drops it with `CompactKeepAlignment=0`; a lock held by another process
+  refuses writers and opening, a stale lock file is ignored and removed.
 - Settings: ini writer (comments, order, CRLF, key variants), model ↔ ini round trip,
   shipped ini = defaults, choices and warnings.
 - Options parsing; key parsing (hex/base64); pack planning; view mapping (incl. Unicode).

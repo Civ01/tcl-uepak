@@ -4,7 +4,11 @@ use super::*;
 use crate::archive::{Archive, ExtractError, OpenError};
 
 /// Paths we already warned about (missing Oodle), to avoid repeat popups.
-pub(crate) static OODLE_WARNED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+/// The missing-Oodle warning is shown once per TC session: a missing
+/// library is the same problem for every pak, and Find Files over a game
+/// folder would otherwise show it for each one.
+pub(crate) static OODLE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn oodle_missing_text(archive: &Path, detail: &str) -> String {
     let deps = config::deps_dir()
@@ -20,13 +24,11 @@ pub(crate) fn oodle_missing_text(archive: &Path, detail: &str) -> String {
 }
 
 pub(crate) fn warn_oodle_once(archive: &Path, detail: &str) {
-    let mut guard = OODLE_WARNED.lock().unwrap_or_else(|e| e.into_inner());
-    if guard
-        .get_or_insert_with(HashSet::new)
-        .insert(archive.to_path_buf())
-    {
-        drop(guard);
+    use std::sync::atomic::Ordering;
+    if !OODLE_WARNED.swap(true, Ordering::SeqCst) {
         show_warning(&oodle_missing_text(archive, detail));
+    } else {
+        dlog!("  (missing-Oodle warning already shown this session)");
     }
 }
 
@@ -34,20 +36,37 @@ pub(crate) unsafe fn archive<'a>(h: Handle) -> Option<&'a mut Archive> {
     (h as *mut Archive).as_mut()
 }
 
-/// Paks whose key prompt was cancelled, and when. TC opens a pak several
-/// times per operation (list, then extract); don't ask again right away.
-pub(crate) static DECLINED: Mutex<Vec<(PathBuf, std::time::Instant)>> = Mutex::new(Vec::new());
+/// Cancelled key prompts, per (folder, key GUID), and when. TC opens a pak
+/// several times per operation (list, then extract), and Find Files opens
+/// every pak of a folder: after a Cancel, other paks of the same folder that
+/// need the same key don't ask again. Each pak that would have asked renews
+/// the pause, so a long search stays quiet; it ends 10 s after the last.
+pub(crate) static DECLINED: Mutex<Vec<(String, std::time::Instant)>> = Mutex::new(Vec::new());
 pub(crate) const DECLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
-pub(crate) fn recently_declined(path: &Path) -> bool {
-    let mut d = DECLINED.lock().unwrap_or_else(|e| e.into_inner());
-    d.retain(|(_, t)| t.elapsed() < DECLINE_GRACE);
-    d.iter().any(|(p, _)| p == path)
+fn decline_key(path: &Path, guid: &str) -> String {
+    let folder = path.parent().unwrap_or(Path::new(""));
+    format!("{}|{guid}", folder.to_string_lossy().to_lowercase())
 }
 
-pub(crate) fn mark_declined(path: &Path) {
+pub(crate) fn recently_declined(path: &Path, guid: &str) -> bool {
+    let k = decline_key(path, guid);
     let mut d = DECLINED.lock().unwrap_or_else(|e| e.into_inner());
-    d.push((path.to_path_buf(), std::time::Instant::now()));
+    d.retain(|(_, t)| t.elapsed() < DECLINE_GRACE);
+    match d.iter_mut().find(|(p, _)| *p == k) {
+        Some(e) => {
+            e.1 = std::time::Instant::now();
+            true
+        }
+        None => false,
+    }
+}
+
+pub(crate) fn mark_declined(path: &Path, guid: &str) {
+    let k = decline_key(path, guid);
+    let mut d = DECLINED.lock().unwrap_or_else(|e| e.into_inner());
+    d.retain(|(p, _)| *p != k);
+    d.push((k, std::time::Instant::now()));
 }
 
 pub(crate) fn pak_guid(path: &Path) -> String {
@@ -113,8 +132,8 @@ pub(crate) fn open_with_keys(path: &Path, options: &config::Options) -> Result<A
             Err(e) => return Err(e),
         }
     }
-    if recently_declined(path) {
-        dlog!("  key prompt was cancelled moments ago; not asking again");
+    if recently_declined(path, &guid) {
+        dlog!("  key prompt for this folder and key was cancelled moments ago; not asking again");
         return Err(OpenError::Cancelled);
     }
     let mut error: Option<String> = stale.map(|from| stale_key_message(&guid, &from));
@@ -126,7 +145,7 @@ pub(crate) fn open_with_keys(path: &Path, options: &config::Options) -> Result<A
         });
         let Some(answer) = answer else {
             dlog!("  key prompt cancelled");
-            mark_declined(path);
+            mark_declined(path, &guid);
             return Err(OpenError::Cancelled);
         };
         let key = match keys::AesKey::parse(&answer.text) {
@@ -589,7 +608,7 @@ pub(crate) fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) 
         Err(ExtractError::Read(repak::Error::OodleFailed(e))) => {
             if !arc.oodle_warned {
                 arc.oodle_warned = true;
-                show_warning(&oodle_missing_text(&arc.path, &e.to_string()));
+                warn_oodle_once(&arc.path, &e.to_string());
             }
             E_NOT_SUPPORTED
         }

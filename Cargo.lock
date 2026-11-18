@@ -219,7 +219,7 @@ dependencies = [
 [[package]]
 name = "oodle_loader"
 version = "0.2.3"
-source = "git+https://github.com/Civ01/repak?branch=oodle-search-paths#d6fafc6730a2e55b36eb3766c7590068d41d438d"
+source = "git+https://github.com/Civ01/repak?branch=oodle-search-paths#0c5835020a5de084305b2bd276554c0dc678f749"
 dependencies = [
  "libloading",
  "thiserror",
@@ -258,7 +258,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "repak"
 version = "0.2.3"
-source = "git+https://github.com/Civ01/repak?branch=oodle-search-paths#d6fafc6730a2e55b36eb3766c7590068d41d438d"
+source = "git+https://github.com/Civ01/repak?branch=oodle-search-paths#0c5835020a5de084305b2bd276554c0dc678f749"
 dependencies = [
  "aes",
  "byteorder",

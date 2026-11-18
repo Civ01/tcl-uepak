@@ -149,6 +149,74 @@ mod imp {
         (ok != 0).then_some(free)
     }
 
+    /// Paths shown by TC's two panels (path labels, e.g.
+    /// `z:\\games\\x.pak\\*.*`), asked from TC's main window in this process
+    /// with TC's documented `WM_USER+50` (9 = left, 10 = right path label).
+    /// `None` if TC's window isn't found or doesn't answer within 500 ms.
+    pub fn tc_panel_paths() -> Option<[String; 2]> {
+        use windows_sys::Win32::Foundation::{HWND, LPARAM};
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetClassNameW, GetWindowThreadProcessId, SendMessageTimeoutW,
+            SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_GETTEXT, WM_USER,
+        };
+        unsafe extern "system" fn find(h: HWND, l: LPARAM) -> i32 {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, &mut pid);
+            if pid != GetCurrentProcessId() {
+                return 1;
+            }
+            let mut b = [0u16; 64];
+            let n = GetClassNameW(h, b.as_mut_ptr(), 64);
+            if String::from_utf16_lossy(&b[..n.max(0) as usize]) == "TTOTAL_CMD" {
+                *(l as *mut HWND) = h;
+                return 0;
+            }
+            1
+        }
+        let mut tc: HWND = std::ptr::null_mut();
+        unsafe { EnumWindows(Some(find), &mut tc as *mut HWND as LPARAM) };
+        if tc.is_null() {
+            return None;
+        }
+        let ask = |h: HWND, msg: u32, wp: usize, lp: isize| -> Option<usize> {
+            let mut r = 0usize;
+            let ok = unsafe {
+                SendMessageTimeoutW(h, msg, wp, lp, SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &mut r)
+            };
+            (ok != 0).then_some(r)
+        };
+        let mut out = [String::new(), String::new()];
+        for (i, w) in [9usize, 10].into_iter().enumerate() {
+            let label = ask(tc, WM_USER + 50, w, 0)? as HWND;
+            if label.is_null() {
+                return None;
+            }
+            let mut buf = vec![0u16; 2048];
+            let n = ask(label, WM_GETTEXT, buf.len(), buf.as_mut_ptr() as isize)?;
+            out[i] = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+        }
+        Some(out)
+    }
+
+    /// Yes/No/Cancel question box: 6 = Yes, 7 = No, 2 = Cancel.
+    pub fn ask_yes_no_cancel(text: &str) -> i32 {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONQUESTION, MB_YESNOCANCEL};
+        let text = wide(text);
+        let caption = wide(CAPTION);
+        unsafe {
+            let owner = GetActiveWindow();
+            let top = if owner.is_null() { MB_TOPMOST } else { 0 };
+            MessageBoxW(
+                owner,
+                text.as_ptr(),
+                caption.as_ptr(),
+                MB_YESNOCANCEL | MB_ICONQUESTION | MB_TASKMODAL | MB_SETFOREGROUND | top,
+            )
+        }
+    }
+
     /// Yes/No question box; true = Yes.
     pub fn ask_yes_no(text: &str) -> bool {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
@@ -335,6 +403,14 @@ mod imp {
     pub fn ask_yes_no(text: &str) -> bool {
         eprintln!("[{CAPTION}] question (answered No): {text}");
         false
+    }
+
+    pub fn tc_panel_paths() -> Option<[String; 2]> {
+        None
+    }
+
+    pub fn ask_yes_no_cancel(_text: &str) -> i32 {
+        2
     }
 
     pub fn clear_attrs(_path: &std::path::Path, _bits: u32) -> bool {

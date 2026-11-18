@@ -279,9 +279,38 @@ pub fn rebuild_path(pak: &Path) -> PathBuf {
 /// original is untouched, and any failure only deletes the new file.
 /// `progress(copied, total)` reports the copy; `false` cancels. Returns the
 /// new file size.
+/// UnrealPak can start entries on a boundary (1–2 MB in a UE 5.6 pak), with
+/// zero padding before them. An entry counts as aligned when there is a gap
+/// before it and its offset is a multiple of at least 4 KB; the pak's
+/// alignment is the smallest such boundary. Returns it with the aligned
+/// entries' paths.
+pub fn detect_alignment(entries: &[(u64, u64, String)]) -> Option<(u64, Vec<String>)> {
+    let mut sorted: Vec<&(u64, u64, String)> = entries.iter().collect();
+    sorted.sort();
+    let mut prev_end = 0u64;
+    let mut found: Vec<(u64, &str)> = vec![];
+    for (offset, end, path) in sorted {
+        if *offset > prev_end && *offset > 0 && offset.trailing_zeros() >= 12 {
+            found.push((*offset, path));
+        }
+        prev_end = prev_end.max(*end);
+    }
+    let align = found
+        .iter()
+        .map(|(o, _)| 1u64 << o.trailing_zeros().min(30))
+        .min()?;
+    let paths = found
+        .into_iter()
+        .filter(|(o, _)| o % align == 0)
+        .map(|(_, p)| p.to_string())
+        .collect();
+    Some((align, paths))
+}
+
 pub fn rebuild<F>(
     pak: &Path,
     key: Option<&crate::keys::AesKey>,
+    keep_alignment: bool,
     removals: &[String],
     progress: &mut dyn FnMut(u64, u64) -> bool,
     edit: F,
@@ -295,6 +324,21 @@ where
     let mut src = BufReader::new(File::open(pak)?);
     let reader = builder(key).reader(&mut src)?;
     let encrypt_new = key.is_some() && reader.entries().any(|(_, e)| e.encrypted);
+    let all: Vec<(u64, u64, String)> = reader
+        .entries()
+        .map(|(p, e)| (e.offset, e.data_end, p.to_string()))
+        .collect();
+    let alignment = if keep_alignment {
+        detect_alignment(&all)
+    } else {
+        None
+    };
+    if let Some((a, paths)) = &alignment {
+        dlog!(
+            "  keeping alignment: {} entries on {a}-byte boundaries",
+            paths.len()
+        );
+    }
     let mut kept: Vec<(u64, u64, String)> = reader
         .entries()
         .filter(|(p, _)| !removals.iter().any(|r| r == p))
@@ -314,6 +358,11 @@ where
         w.set_encrypt_entries(encrypt_new);
         let mut copied = 0u64;
         for (_, _, path) in &kept {
+            if let Some((a, paths)) = &alignment {
+                if paths.iter().any(|p| p == path) {
+                    w.align_to(*a)?;
+                }
+            }
             w.copy_entry(&reader, path, path, &mut src, &mut |n| {
                 copied += n;
                 progress(copied, total)

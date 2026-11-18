@@ -56,6 +56,22 @@ pub const ATTRS: [(u32, &str); 5] = [
     (0, "None"),
 ];
 
+pub const AUTO_COMPACT: [(u64, &str); 5] = [
+    (0, "Off"),
+    (1 << 20, "1 MB"),
+    (10 << 20, "10 MB (default)"),
+    (100 << 20, "100 MB"),
+    (1 << 30, "1 GB"),
+];
+
+fn auto_compact_text(v: u64) -> String {
+    if v == 0 {
+        "0".into()
+    } else {
+        undo_limit_text(v)
+    }
+}
+
 pub const UNDO_LIMITS: [(u64, &str); 6] = [
     (0, "Always ask"),
     (256 << 20, "256 MB"),
@@ -85,6 +101,9 @@ pub struct Model {
     pub block_size: u32,
     pub undo_limit: u64,
     pub compact: bool,
+    pub auto_compact_under: u64,
+    /// Not in the dialog: kept as loaded.
+    pub compact_keep_alignment: bool,
     pub view: MountPointMode,
     pub mount_folder_attr: u32,
     pub debug_log: bool,
@@ -101,6 +120,8 @@ impl Model {
             block_size: o.pack.block_size,
             undo_limit: o.pack.undo_limit,
             compact: o.pack.compact,
+            auto_compact_under: o.pack.auto_compact_under,
+            compact_keep_alignment: o.pack.compact_keep_alignment,
             view: o.mount_point,
             mount_folder_attr: o.mount_folder_attr,
             debug_log: o.debug_log,
@@ -145,6 +166,23 @@ impl Model {
             v.push((
                 self.block_size,
                 format!("{} bytes (custom)", self.block_size),
+            ));
+        }
+        v
+    }
+
+    pub fn auto_compact_choices(&self) -> Vec<(u64, String)> {
+        let mut v: Vec<(u64, String)> = AUTO_COMPACT
+            .iter()
+            .map(|(b, l)| (*b, l.to_string()))
+            .collect();
+        if !v.iter().any(|(b, _)| *b == self.auto_compact_under) {
+            v.push((
+                self.auto_compact_under,
+                format!(
+                    "{} (custom)",
+                    crate::config::human_size(self.auto_compact_under)
+                ),
             ));
         }
         v
@@ -195,6 +233,8 @@ impl Model {
             oodle_compressor: self.oodle_compressor,
             undo_limit: self.undo_limit,
             compact: self.compact,
+            auto_compact_under: self.auto_compact_under,
+            compact_keep_alignment: self.compact_keep_alignment,
         };
         if let Err(e) = crate::pack::check_settings(&opts) {
             w.push(e);
@@ -288,6 +328,11 @@ impl Model {
                 "Pack",
                 "Compact",
                 if self.compact { "1" } else { "0" }.into(),
+            ),
+            (
+                "Pack",
+                "AutoCompactUnder",
+                auto_compact_text(self.auto_compact_under),
             ),
         ]
     }
@@ -415,6 +460,7 @@ mod tests {
         m.block_size = 262144;
         m.undo_limit = 4 << 30;
         m.compact = true;
+        m.auto_compact_under = 100 << 20;
         m.view = MountPointMode::Root;
         m.mount_folder_attr = ATTR_HIDDEN;
         m.debug_log = true;

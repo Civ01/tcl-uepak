@@ -89,6 +89,26 @@ pub struct PackOptions {
     pub undo_limit: u64,
     /// Rebuild the whole pak when changing it (no dead space, no undo file).
     pub compact: bool,
+    /// Paks smaller than this are always compacted, whatever `compact`
+    /// says; 0 = off (SPEC §4.4).
+    pub auto_compact_under: u64,
+    /// Compacting keeps the alignment UnrealPak gave entries (§4.4).
+    pub compact_keep_alignment: bool,
+}
+
+pub const DEFAULT_AUTO_COMPACT_UNDER: u64 = 10 << 20;
+
+impl PackOptions {
+    /// Whether changing a pak of `pak_size` bytes rebuilds it, and why.
+    pub fn compact_for(&self, pak_size: u64) -> (bool, &'static str) {
+        if self.auto_compact_under > 0 && pak_size < self.auto_compact_under {
+            (true, "AutoCompactUnder")
+        } else if self.compact {
+            (true, "Compact")
+        } else {
+            (false, "in place")
+        }
+    }
 }
 
 pub const DEFAULT_UNDO_LIMIT: u64 = 1 << 30;
@@ -213,6 +233,8 @@ impl Default for PackOptions {
             oodle_compressor: repak::OodleCompressor::Mermaid,
             undo_limit: DEFAULT_UNDO_LIMIT,
             compact: false,
+            auto_compact_under: DEFAULT_AUTO_COMPACT_UNDER,
+            compact_keep_alignment: true,
         }
     }
 }
@@ -415,6 +437,18 @@ pub fn parse_options(text: &str) -> Options {
                     Some(l) => opts.pack.level = Some(l),
                     None => bad(),
                 },
+                "autocompactunder" => match raw.to_ascii_lowercase().as_str() {
+                    "" | "0" | "off" | "none" | "no" => opts.pack.auto_compact_under = 0,
+                    _ => match parse_bytes(raw) {
+                        Some(v) => opts.pack.auto_compact_under = v,
+                        None => bad(),
+                    },
+                },
+                "compactkeepalignment" => match raw.to_ascii_lowercase().as_str() {
+                    "1" | "yes" | "true" | "on" | "" => opts.pack.compact_keep_alignment = true,
+                    "0" | "no" | "false" | "off" => opts.pack.compact_keep_alignment = false,
+                    _ => bad(),
+                },
                 "compact" => match raw.to_ascii_lowercase().as_str() {
                     "1" | "yes" | "true" | "on" => opts.pack.compact = true,
                     "0" | "no" | "false" | "off" | "" => opts.pack.compact = false,
@@ -522,6 +556,36 @@ mod tests {
         );
         assert_eq!(parse_options("[Pack]\nUndoLimit=0").pack.undo_limit, 0);
         assert!(!d.pack.compact);
+        assert_eq!(d.pack.auto_compact_under, 10 << 20);
+        assert!(d.pack.compact_keep_alignment);
+        assert_eq!(
+            parse_options("[Pack]\nAutoCompactUnder=0")
+                .pack
+                .auto_compact_under,
+            0
+        );
+        assert_eq!(
+            parse_options("[Pack]\nAutoCompactUnder=off")
+                .pack
+                .auto_compact_under,
+            0
+        );
+        assert_eq!(
+            parse_options("[Pack]\nAutoCompactUnder=100M")
+                .pack
+                .auto_compact_under,
+            100 << 20
+        );
+        assert!(
+            !parse_options("[Pack]\nCompactKeepAlignment=0")
+                .pack
+                .compact_keep_alignment
+        );
+        let p = parse_options("[Pack]\nAutoCompactUnder=10M\nCompact=0").pack;
+        assert_eq!(p.compact_for(5 << 20), (true, "AutoCompactUnder"));
+        assert_eq!(p.compact_for(10 << 20), (false, "in place"));
+        let p = parse_options("[Pack]\nAutoCompactUnder=0\nCompact=1").pack;
+        assert_eq!(p.compact_for(1), (true, "Compact"));
         assert!(parse_options("[Pack]\nCompact=1").pack.compact);
         assert!(!parse_options("[Pack]\nCompact=0").pack.compact);
         assert_eq!(
