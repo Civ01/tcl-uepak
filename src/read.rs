@@ -84,6 +84,9 @@ pub(crate) fn open_with_keys(path: &Path, options: &config::Options) -> Result<A
     let folder = path.parent().unwrap_or(Path::new("")).to_path_buf();
     let guid = pak_guid(path);
     dlog!("  index encrypted, key guid {guid}; looking for a key");
+    // a remembered key with this exact non-zero GUID that no longer fits
+    // means the game most likely re-encrypted its paks with a new key
+    let mut stale: Option<String> = None;
     for (key, source, from) in keys::candidates(&folder, &guid) {
         match Archive::open(path, options, Some(&key)) {
             Ok(arc) => {
@@ -94,7 +97,10 @@ pub(crate) fn open_with_keys(path: &Path, options: &config::Options) -> Result<A
                 return Ok(arc);
             }
             Err(OpenError::WrongKey) => {
-                dlog!("  key from {source:?} record ({from}) does not match")
+                dlog!("  key from {source:?} record ({from}) does not match");
+                if stale.is_none() {
+                    stale = Some(from.clone());
+                }
             }
             Err(e) => return Err(e),
         }
@@ -103,7 +109,7 @@ pub(crate) fn open_with_keys(path: &Path, options: &config::Options) -> Result<A
         dlog!("  key prompt was cancelled moments ago; not asking again");
         return Err(OpenError::Cancelled);
     }
-    let mut error: Option<String> = None;
+    let mut error: Option<String> = stale.map(|from| stale_key_message(&guid, &from));
     loop {
         let answer = dialog::prompt_key(&dialog::KeyPrompt {
             pak: path,
@@ -135,6 +141,23 @@ pub(crate) fn open_with_keys(path: &Path, options: &config::Options) -> Result<A
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// Shown in the key dialog when a remembered key matched this pak's key GUID
+/// (or folder) but doesn't decrypt it (SPEC §3.4).
+pub(crate) fn stale_key_message(guid: &str, from: &str) -> String {
+    if guid != keys::ZERO_GUID {
+        format!(
+            "The key saved for this key GUID doesn't match this pak. The GUID is the same, so \
+             the pak was most likely re-encrypted with a new key by a game update. Enter the \
+             new key. (Saved for: {from})"
+        )
+    } else {
+        format!(
+            "The key saved for this folder doesn't match this pak; the game may have been \
+             updated with a new key. Enter the new key. (Saved for: {from})"
+        )
     }
 }
 
@@ -402,7 +425,9 @@ pub(crate) fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) 
                 inner: io::sink(),
                 name: win::wide(&display),
             };
-            arc.read_current(&mut out).map_err(ExtractError::from_repak)
+            // PK_TEST also checks each entry's SHA-1 (SPEC §3.3)
+            arc.read_current(&mut out, true)
+                .map_err(ExtractError::from_repak)
         }
         PK_EXTRACT => {
             let Some(dest) = dest else { return E_ECREATE };
@@ -428,6 +453,10 @@ pub(crate) fn process_impl(arc: &mut Archive, op: c_int, dest: Option<PathBuf>) 
         }
         Err(ExtractError::Read(repak::Error::Encrypted | repak::Error::Encryption)) => {
             E_NOT_SUPPORTED
+        }
+        Err(ExtractError::Read(repak::Error::HashMismatch)) => {
+            dlog!("  SHA-1 mismatch: the entry's data is damaged");
+            E_BAD_DATA
         }
         Err(ExtractError::Read(_)) if arc.current_item().is_some_and(|i| i.info.encrypted) => {
             dlog!("  decrypting failed: the remembered key may not match this pak's entries");

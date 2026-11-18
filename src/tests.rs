@@ -1108,6 +1108,9 @@ fn reroot_question_explains_the_new_folder() {
         version: repak::Version::V11,
         entries: vec!["UserEngine.ini".into()],
         slots: vec![],
+        spans: vec![(0, 100)],
+        index_offset: 100,
+        file_len: 300,
     };
     let mount = crate::view::Mount::parse(&info.mount);
     let plan = pack::plan(
@@ -1132,4 +1135,248 @@ fn reroot_question_explains_the_new_folder() {
         "{q}"
     );
     assert!(q.contains("New files go to: G1R/Readme.txt"), "{q}");
+}
+
+// ---------------------------------------------------------------------------
+// M3: streaming, space reuse, undo limit, free space, verification
+
+fn pak_len(p: &Path) -> u64 {
+    std::fs::metadata(p).unwrap().len()
+}
+
+#[test]
+fn replacing_the_last_file_reuses_its_space() {
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, src) = base_pak("m3-reuse");
+    list(&pak).unwrap();
+    std::fs::create_dir_all(src.join("Config")).unwrap();
+    std::fs::write(src.join("Config").join("x.ini"), b"[x]\nk=w\n").unwrap();
+    let before = pak_len(&pak);
+    for i in 0..5 {
+        std::fs::write(src.join("Config").join("x.ini"), format!("[x]\nk={i}\n")).unwrap();
+        let r = pack_ffi(&pak, Some("TheIsle\\Content"), &src, "Config\\x.ini", 2);
+        assert_eq!(r, 0);
+    }
+    assert_eq!(
+        pak_len(&pak),
+        before,
+        "no growth: the last entry's space is reused"
+    );
+    let back = read_back(&pak);
+    assert_eq!(
+        back.iter().find(|(n, _)| n == "Config/x.ini").unwrap().1,
+        b"[x]\nk=4\n"
+    );
+    // deleting it truncates the pak to where it started
+    assert_eq!(delete_ffi(&pak, "TheIsle\\Content\\Config\\x.ini"), 0);
+    assert!(pak_len(&pak) < before);
+    assert_eq!(read_back(&pak).len(), 1);
+}
+
+#[test]
+fn undo_limit_asks_and_falls_back_to_appending() {
+    use crate::config::PackOptions;
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (pak, src) = base_pak("m3-undo");
+    list(&pak).unwrap();
+    std::fs::create_dir_all(src.join("Config")).unwrap();
+    std::fs::write(src.join("Config").join("x.ini"), b"new").unwrap();
+    let opts = PackOptions {
+        undo_limit: 0,
+        ..PackOptions::default()
+    };
+    let items = ["Config\\x.ini".to_string()];
+    let before = pak_len(&pak);
+    // reuse question: No -> append; then the plain undo is over the limit too: Yes
+    confirm_next(&[false, true]);
+    let r = crate::pack_files(&pak, Some("TheIsle\\Content"), &src, &items, 2, &opts);
+    assert_eq!(r, 0);
+    assert!(pak_len(&pak) > before, "appended: the pak grew");
+    assert!(
+        crate::dialog::TEST_CONFIRMS.lock().unwrap().is_empty(),
+        "both questions asked"
+    );
+    // reuse question: Yes -> reuses the (now dead) tail
+    let grown = pak_len(&pak);
+    confirm_next(&[true]);
+    assert_eq!(
+        crate::pack_files(&pak, Some("TheIsle\\Content"), &src, &items, 2, &opts),
+        0
+    );
+    assert!(pak_len(&pak) < grown, "reused the space at the end");
+    // both answered No -> nothing changes
+    let now = std::fs::read(&pak).unwrap();
+    confirm_next(&[false, false]);
+    assert_eq!(
+        crate::pack_files(&pak, Some("TheIsle\\Content"), &src, &items, 2, &opts),
+        E_EABORTED
+    );
+    assert_eq!(std::fs::read(&pak).unwrap(), now);
+    // a generous limit asks nothing
+    confirm_next(&[]);
+    let big = PackOptions::default();
+    assert_eq!(
+        crate::pack_files(&pak, Some("TheIsle\\Content"), &src, &items, 2, &big),
+        0
+    );
+}
+
+#[test]
+fn low_free_space_asks_before_writing() {
+    use crate::config::PackOptions;
+    let _g = CONFIRM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (src, add, _files) = make_source("m3-space");
+    let pak = src.parent().unwrap().join("space.pak");
+    pack::TEST_FREE_SPACE.with(|c| c.set(Some(1000)));
+    confirm_next(&[false]);
+    let r = crate::pack_files(&pak, None, &src, &add, 2, &PackOptions::default());
+    assert_eq!(r, E_EABORTED);
+    assert!(!pak.exists(), "nothing written after No");
+    confirm_next(&[true]);
+    let r = crate::pack_files(&pak, None, &src, &add, 2, &PackOptions::default());
+    pack::TEST_FREE_SPACE.with(|c| c.set(None));
+    assert_eq!(r, 0, "Yes continues (compression may make it fit)");
+}
+
+#[test]
+fn test_mode_detects_damaged_entries() {
+    let dir = tmp("m3-verify");
+    let pak = dir.join("v.pak");
+    make_pak_v(
+        &pak,
+        repak::Version::V11,
+        &[("a.txt", b"original content".to_vec())],
+    );
+    let mut bytes = std::fs::read(&pak).unwrap();
+    let pos = bytes.windows(8).position(|w| w == b"original").unwrap();
+    bytes[pos] = b'O';
+    std::fs::write(&pak, &bytes).unwrap();
+    let name = wide(&pak.to_string_lossy());
+    let mut data = OpenArchiveDataW {
+        ArcName: name.as_ptr(),
+        OpenMode: PK_OM_EXTRACT,
+        OpenResult: 0,
+        CmtBuf: std::ptr::null_mut(),
+        CmtBufSize: 0,
+        CmtSize: 0,
+        CmtState: 0,
+    };
+    let h = unsafe { OpenArchiveW(&mut data) };
+    assert!(!h.is_null());
+    let mut seen_bad = false;
+    loop {
+        let mut hd: Box<HeaderDataExW> = unsafe { Box::new(std::mem::zeroed()) };
+        if unsafe { ReadHeaderExW(h, &mut *hd) } == E_END_ARCHIVE {
+            break;
+        }
+        if hd.FileAttr & 0x10 != 0 {
+            continue;
+        }
+        let r = unsafe { ProcessFileW(h, PK_TEST, std::ptr::null(), std::ptr::null()) };
+        seen_bad |= r == E_BAD_DATA;
+    }
+    unsafe { CloseArchive(h) };
+    assert!(seen_bad, "PK_TEST reports the damaged entry");
+}
+
+#[test]
+fn big_file_streams_through_pack_and_extract() {
+    use crate::config::{PackCompression, PackOptions};
+    let dir = tmp("m3-big");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // 40 MB by default (UEPAK_BIG_MB to change), compressible, many blocks
+    let blocks: usize = std::env::var("UEPAK_BIG_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(640, |mb| mb * 16);
+    eprintln!("big file: {} MB", blocks / 16);
+    let block: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+    {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(src.join("big.bin")).unwrap());
+        for _ in 0..blocks {
+            std::io::Write::write_all(&mut f, &block).unwrap();
+        }
+    }
+    for comp in [
+        PackCompression::None,
+        PackCompression::Zlib,
+        PackCompression::Lz4,
+    ] {
+        let pak = dir.join(format!("{comp:?}.pak"));
+        let opts = PackOptions {
+            compression: comp,
+            ..PackOptions::default()
+        };
+        assert_eq!(
+            crate::pack_files(&pak, None, &src, &["big.bin".into()], 2, &opts),
+            0
+        );
+        // extract through the plugin; compare by streaming (no whole-file read)
+        let name = wide(&pak.to_string_lossy());
+        let mut data = OpenArchiveDataW {
+            ArcName: name.as_ptr(),
+            OpenMode: PK_OM_EXTRACT,
+            OpenResult: 0,
+            CmtBuf: std::ptr::null_mut(),
+            CmtBufSize: 0,
+            CmtSize: 0,
+            CmtState: 0,
+        };
+        let h = unsafe { OpenArchiveW(&mut data) };
+        let mut hd: Box<HeaderDataExW> = unsafe { Box::new(std::mem::zeroed()) };
+        assert_eq!(unsafe { ReadHeaderExW(h, &mut *hd) }, 0);
+        let target = dir.join(format!("out-{comp:?}.bin"));
+        let tw = wide(&target.to_string_lossy());
+        assert_eq!(
+            unsafe { ProcessFileW(h, PK_EXTRACT, std::ptr::null(), tw.as_ptr()) },
+            0
+        );
+        assert_eq!(
+            unsafe { ProcessFileW(h, PK_TEST, std::ptr::null(), std::ptr::null()) },
+            0
+        );
+        unsafe { CloseArchive(h) };
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().len(),
+            (blocks * 65536) as u64
+        );
+        let mut f = std::io::BufReader::new(std::fs::File::open(&target).unwrap());
+        let mut buf = vec![0u8; 65536];
+        for _ in 0..blocks {
+            std::io::Read::read_exact(&mut f, &mut buf).unwrap();
+            assert!(buf == block, "{comp:?} content");
+        }
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&pak);
+    }
+}
+
+#[test]
+fn stale_key_for_same_guid_says_it_probably_changed() {
+    let _g = KEY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::keys::clear_session();
+    crate::dialog::TEST_ANSWERS.lock().unwrap().clear();
+    // repak's test pak with a non-zero key GUID patched into the footer
+    // (the GUID isn't covered by the index hash)
+    let pak = copy_to_tmp("stale-key", &testdata("enc_index.pak"));
+    let mut bytes = std::fs::read(&pak).unwrap();
+    let magic = archive::PAK_MAGIC.to_le_bytes();
+    let pos = bytes.windows(4).rposition(|w| w == magic).unwrap();
+    bytes[pos - 17..pos - 1].copy_from_slice(&[0xAB; 16]);
+    std::fs::write(&pak, &bytes).unwrap();
+    let guid = archive::sniff_footer(&pak).unwrap().key_guid.unwrap();
+    assert_eq!(guid, "AB".repeat(16));
+    // an old key remembered for that GUID in another folder
+    let other = tmp("stale-key-other");
+    crate::keys::remember(&other, &guid, &crate::keys::AesKey([0x11; 32]), false).unwrap();
+    answer(Some((TEST_KEY_B64, false)));
+    assert_eq!(list(&pak).unwrap().len(), 4);
+    let shown = crate::dialog::TEST_LAST_ERROR
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_default();
+    assert!(shown.contains("re-encrypted with a new key"), "{shown}");
+    crate::keys::clear_session();
 }

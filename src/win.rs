@@ -113,6 +113,23 @@ mod imp {
         }
     }
 
+    /// Free bytes available to this user on the volume holding `dir`.
+    pub fn free_space(dir: &std::path::Path) -> Option<u64> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let w: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let mut free = 0u64;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                w.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(free)
+    }
+
     /// Yes/No question box; true = Yes.
     pub fn ask_yes_no(text: &str) -> bool {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
@@ -295,6 +312,10 @@ mod imp {
     pub fn ask_yes_no(text: &str) -> bool {
         eprintln!("[{CAPTION}] question (answered No): {text}");
         false
+    }
+
+    pub fn free_space(_dir: &std::path::Path) -> Option<u64> {
+        None
     }
 
     pub fn dos_time(_t: SystemTime) -> i32 {

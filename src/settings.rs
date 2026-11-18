@@ -56,6 +56,24 @@ pub const ATTRS: [(u32, &str); 5] = [
     (0, "None"),
 ];
 
+pub const UNDO_LIMITS: [(u64, &str); 6] = [
+    (0, "Always ask"),
+    (256 << 20, "256 MB"),
+    (1 << 30, "1 GB (default)"),
+    (4 << 30, "4 GB"),
+    (16 << 30, "16 GB"),
+    (u64::MAX, "No limit"),
+];
+
+fn undo_limit_text(v: u64) -> String {
+    match v {
+        u64::MAX => "unlimited".into(),
+        v if v % (1 << 30) == 0 && v > 0 => format!("{}G", v >> 30),
+        v if v % (1 << 20) == 0 && v > 0 => format!("{}M", v >> 20),
+        v => v.to_string(),
+    }
+}
+
 /// Everything the dialog edits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
@@ -65,6 +83,7 @@ pub struct Model {
     pub level: Option<i32>,
     pub oodle_compressor: repak::OodleCompressor,
     pub block_size: u32,
+    pub undo_limit: u64,
     pub view: MountPointMode,
     pub mount_folder_attr: u32,
     pub debug_log: bool,
@@ -79,6 +98,7 @@ impl Model {
             level: o.pack.level,
             oodle_compressor: o.pack.oodle_compressor,
             block_size: o.pack.block_size,
+            undo_limit: o.pack.undo_limit,
             view: o.mount_point,
             mount_folder_attr: o.mount_folder_attr,
             debug_log: o.debug_log,
@@ -128,6 +148,20 @@ impl Model {
         v
     }
 
+    pub fn undo_choices(&self) -> Vec<(u64, String)> {
+        let mut v: Vec<(u64, String)> = UNDO_LIMITS
+            .iter()
+            .map(|(b, l)| (*b, l.to_string()))
+            .collect();
+        if !v.iter().any(|(b, _)| *b == self.undo_limit) {
+            v.push((
+                self.undo_limit,
+                format!("{} (custom)", crate::config::human_size(self.undo_limit)),
+            ));
+        }
+        v
+    }
+
     pub fn attr_choices(&self) -> Vec<(u32, String)> {
         let mut v: Vec<(u32, String)> = ATTRS.iter().map(|(a, l)| (*a, l.to_string())).collect();
         if !v.iter().any(|(a, _)| *a == self.mount_folder_attr) {
@@ -157,6 +191,7 @@ impl Model {
             block_size: self.block_size,
             level: self.level,
             oodle_compressor: self.oodle_compressor,
+            undo_limit: self.undo_limit,
         };
         if let Err(e) = crate::pack::check_settings(&opts) {
             w.push(e);
@@ -245,6 +280,7 @@ impl Model {
             ("Pack", "Level", level),
             ("Pack", "OodleCompressor", oodle),
             ("Pack", "BlockSize", self.block_size.to_string()),
+            ("Pack", "UndoLimit", undo_limit_text(self.undo_limit)),
         ]
     }
 }
@@ -369,6 +405,7 @@ mod tests {
         m.level = Some(7);
         m.oodle_compressor = repak::OodleCompressor::Kraken;
         m.block_size = 262144;
+        m.undo_limit = 4 << 30;
         m.view = MountPointMode::Root;
         m.mount_folder_attr = ATTR_HIDDEN;
         m.debug_log = true;

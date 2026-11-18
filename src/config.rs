@@ -85,6 +85,49 @@ pub struct PackOptions {
     /// Level for the chosen method; `None` = the method's default.
     pub level: Option<i32>,
     pub oodle_compressor: repak::OodleCompressor,
+    /// Largest undo copy made without asking (SPEC §4.4); `u64::MAX` = no limit.
+    pub undo_limit: u64,
+}
+
+pub const DEFAULT_UNDO_LIMIT: u64 = 1 << 30;
+
+/// `1G`, `512M`, `4096K`, `1073741824`, `0`, `unlimited` -> bytes.
+pub fn parse_bytes(v: &str) -> Option<u64> {
+    let v = v.trim().to_ascii_uppercase();
+    if v == "UNLIMITED" || v == "NONE" || v == "OFF" {
+        return Some(u64::MAX);
+    }
+    let v = v.strip_suffix('B').unwrap_or(&v);
+    let (num, mul) = match v.chars().last() {
+        Some('K') => (&v[..v.len() - 1], 1u64 << 10),
+        Some('M') => (&v[..v.len() - 1], 1 << 20),
+        Some('G') => (&v[..v.len() - 1], 1 << 30),
+        Some('T') => (&v[..v.len() - 1], 1 << 40),
+        _ => (v, 1),
+    };
+    let n: f64 = num.trim().parse().ok()?;
+    (n >= 0.0 && n.is_finite()).then_some((n * mul as f64) as u64)
+}
+
+/// Human-readable size: `1.5 GB`, `640 KB`.
+pub fn human_size(b: u64) -> String {
+    if b == u64::MAX {
+        return "unlimited".into();
+    }
+    const U: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{b} bytes")
+    } else if v >= 100.0 {
+        format!("{v:.0} {}", U[i])
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
 }
 
 /// Oodle level names (Oodle's numeric values).
@@ -166,6 +209,7 @@ impl Default for PackOptions {
             block_size: DEFAULT_BLOCK_SIZE,
             level: None,
             oodle_compressor: repak::OodleCompressor::Mermaid,
+            undo_limit: DEFAULT_UNDO_LIMIT,
         }
     }
 }
@@ -368,6 +412,10 @@ pub fn parse_options(text: &str) -> Options {
                     Some(l) => opts.pack.level = Some(l),
                     None => bad(),
                 },
+                "undolimit" => match parse_bytes(raw) {
+                    Some(b) => opts.pack.undo_limit = b,
+                    None => bad(),
+                },
                 "oodlecompressor" => match OODLE_COMPRESSORS
                     .iter()
                     .find(|(n, _)| n.eq_ignore_ascii_case(raw))
@@ -459,6 +507,19 @@ mod tests {
         assert_eq!(o.pack.compression_options().zlib_level, 9);
         assert_eq!(parse_options("[Pack]\nLevel=").pack.level, None);
         assert_eq!(parse_options("[Pack]\nLevel=fast!").warnings.len(), 1);
+        assert_eq!(d.pack.undo_limit, 1 << 30);
+        assert_eq!(
+            parse_options("[Pack]\nUndoLimit=4G").pack.undo_limit,
+            4 << 30
+        );
+        assert_eq!(parse_options("[Pack]\nUndoLimit=0").pack.undo_limit, 0);
+        assert_eq!(
+            parse_options("[Pack]\nUndoLimit=unlimited").pack.undo_limit,
+            u64::MAX
+        );
+        assert_eq!(parse_bytes("1.5G"), Some(3 << 29));
+        assert_eq!(human_size(3 << 29), "1.5 GB");
+        assert_eq!(human_size(640 << 10), "640 KB");
         assert_eq!(parse_size("1M"), Some(1 << 20));
     }
 

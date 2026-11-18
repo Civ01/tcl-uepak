@@ -189,6 +189,12 @@ pub fn write_new_pak(
 ) -> Result<PackStats, PackError> {
     check_settings(opts).map_err(|m| PackError::User(m, E_NOT_SUPPORTED))?;
     check_oodle(opts)?;
+    let need = source_bytes(plan) + index_estimate(plan.files.iter().map(|f| f.entry.len()));
+    check_space(
+        target.parent().unwrap_or(Path::new(".")),
+        need,
+        "Creating this pak",
+    )?;
     let tmp = tmp_path(target);
     let result = write_to(&tmp, plan, opts);
     match result {
@@ -206,10 +212,133 @@ pub fn write_new_pak(
     }
 }
 
+/// Sum of the source file sizes (missing files count as 0; they fail later).
+fn source_bytes(plan: &Plan) -> u64 {
+    plan.files
+        .iter()
+        .map(|f| std::fs::metadata(&f.source).map(|m| m.len()).unwrap_or(0))
+        .sum()
+}
+
 fn tmp_path(target: &Path) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".uepak-tmp");
     target.with_file_name(name)
+}
+
+/// Marks I/O errors that come from reading a *source* file (vs. writing the pak).
+#[derive(Debug)]
+struct SourceError(PathBuf, std::io::Error);
+impl std::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.0.display(), self.1)
+    }
+}
+impl std::error::Error for SourceError {}
+
+struct Source {
+    file: std::fs::File,
+    path: PathBuf,
+}
+impl std::io::Read for Source {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf).map_err(|e| {
+            let kind = e.kind();
+            std::io::Error::new(kind, SourceError(self.path.clone(), e))
+        })
+    }
+}
+impl std::io::Seek for Source {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+/// repak error -> PackError, telling source-read failures and Cancel apart.
+fn pak_error(e: repak::Error) -> PackError {
+    match e {
+        repak::Error::Cancelled => PackError::Aborted,
+        repak::Error::Io(io) if io.get_ref().is_some_and(|i| i.is::<SourceError>()) => {
+            let inner = io.into_inner().unwrap().downcast::<SourceError>().unwrap();
+            PackError::Read(inner.0, inner.1)
+        }
+        other => PackError::Pak(other),
+    }
+}
+
+/// Streams one source file into `w` block by block, reporting progress to TC
+/// (Cancel works between blocks). Returns the source size.
+fn stream_file<W: Write + std::io::Seek>(
+    w: &mut repak::PakWriter<W>,
+    entry: &str,
+    compress: bool,
+    source: &Path,
+) -> Result<u64, PackError> {
+    let file = std::fs::File::open(source).map_err(|e| PackError::Read(source.to_path_buf(), e))?;
+    let size = file
+        .metadata()
+        .map_err(|e| PackError::Read(source.to_path_buf(), e))?
+        .len();
+    let mut src = Source {
+        file,
+        path: source.to_path_buf(),
+    };
+    let mut name = win::wide(&source.to_string_lossy());
+    let mut reported_any = false;
+    w.write_file_from_reader(entry, compress, &mut src, size, &mut |n| {
+        reported_any = true;
+        progress::report(&mut name, n)
+    })
+    .map_err(pak_error)?;
+    if !reported_any && !progress::report(&mut name, 1) {
+        // empty files: still give TC a chance to cancel
+        return Err(PackError::Aborted);
+    }
+    Ok(size)
+}
+
+/// Free bytes on the volume of `dir` (tests can pin a value).
+fn free_space(dir: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(v) = TEST_FREE_SPACE.with(|c| c.get()) {
+        return Some(v);
+    }
+    win::free_space(dir)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per test thread, so concurrent tests don't see each other's value.
+    pub static TEST_FREE_SPACE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Rough size of a new index for `entries` paths (for space estimates).
+fn index_estimate(paths: impl Iterator<Item = usize>) -> u64 {
+    4096 + paths.map(|len| len as u64 * 2 + 128).sum::<u64>()
+}
+
+/// Asks before starting if the operation may need more than the free space.
+/// `need` is an upper bound (compression usually makes it smaller).
+fn check_space(dir: &Path, need: u64, what: &str) -> Result<(), PackError> {
+    let Some(free) = free_space(dir) else {
+        return Ok(());
+    };
+    dlog!("  space: needs up to {need} bytes, {free} free");
+    if need <= free {
+        return Ok(());
+    }
+    let text = format!(
+        "{what} may need up to {} of free disk space, but only {} is free on that drive.\n\n\
+         Compression can make it smaller, so it may still fit. If the disk fills up, the \
+         operation is undone and nothing is damaged.\n\nContinue anyway?",
+        crate::config::human_size(need),
+        crate::config::human_size(free)
+    );
+    if crate::dialog::confirm(&text) {
+        Ok(())
+    } else {
+        Err(PackError::Aborted)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -237,24 +366,14 @@ fn write_to(path: &Path, plan: &Plan, opts: &PackOptions) -> Result<PackStats, P
     let compress = opts.compression != PackCompression::None;
     let mut stats = PackStats::default();
     for item in &plan.files {
-        // Whole-file read; streaming writes are fork item F5 (SPEC §9).
-        let data =
-            std::fs::read(&item.source).map_err(|e| PackError::Read(item.source.clone(), e))?;
-        writer
-            .write_file(&item.entry, compress, &data)
-            .map_err(PackError::Pak)?;
+        let size = stream_file(&mut writer, &item.entry, compress, &item.source)?;
         stats.files += 1;
-        stats.input_bytes += data.len() as u64;
+        stats.input_bytes += size;
         dlog!(
-            "  + {} ({} bytes) <- {}",
+            "  + {} ({size} bytes) <- {}",
             item.entry,
-            data.len(),
             item.source.display()
         );
-        let mut name = win::wide(&item.source.to_string_lossy());
-        if !progress::report(&mut name, data.len().max(1) as u64) {
-            return Err(PackError::Aborted);
-        }
     }
     let mut out = writer.write_index().map_err(PackError::Pak)?;
     out.flush().map_err(PackError::Write)?;
@@ -312,7 +431,6 @@ impl From<ModifyError> for PackError {
             ModifyError::Io(e) => PackError::Write(e),
             ModifyError::Pak(e) => PackError::Pak(e),
             ModifyError::Aborted => PackError::Aborted,
-            ModifyError::Read(p, e) => PackError::Read(p, e),
             ModifyError::User(m) => PackError::User(m, E_NOT_SUPPORTED),
         }
     }
@@ -345,6 +463,8 @@ fn check_oodle(opts: &PackOptions) -> Result<(), PackError> {
 
 #[derive(Debug, Default)]
 pub struct ModifyStats {
+    /// Bytes of space at the end of the data area that were reused.
+    pub reused: u64,
     pub added: usize,
     pub replaced: usize,
     pub removed: usize,
@@ -427,12 +547,45 @@ pub fn add_to_existing(
         );
     }
 
+    // existing entries replaced by the new files (compared after re-rooting)
+    let removals: Vec<String> = info
+        .entries
+        .iter()
+        .filter(|p| {
+            let renamed = format!("{}{p}", mapping.reroot_prefix).to_lowercase();
+            mapping.entries.iter().any(|e| e.to_lowercase() == renamed)
+        })
+        .cloned()
+        .collect();
+    let write_at = choose_write_at(&info, &removals, opts.undo_limit)?;
+    let start = write_at.unwrap_or(info.index_offset);
+    let new_end = start
+        + source_bytes(plan)
+        + index_estimate(
+            info.entries
+                .iter()
+                .map(|p| p.len() + mapping.reroot_prefix.len())
+                .chain(mapping.entries.iter().map(|e| e.len())),
+        );
+    let need = (info.file_len - start) + new_end.saturating_sub(info.file_len);
+    check_space(
+        target.parent().unwrap_or(Path::new(".")),
+        need,
+        "Changing this pak",
+    )?;
+
     let compress = opts.compression != PackCompression::None;
     let mut stats = ModifyStats {
         new_mount: mapping.new_mount.clone(),
+        replaced: removals.len(),
+        reused: info.index_offset - start,
         ..Default::default()
     };
-    let pak_bytes = modify::modify(target, |w| {
+    for r in &removals {
+        dlog!("  replacing {r}");
+    }
+    let mut failure: Option<PackError> = None;
+    let result = modify::modify(target, &removals, write_at, |w| {
         if let Some(c) = opts.compression.repak() {
             w.set_compression([c]);
         } else {
@@ -446,35 +599,77 @@ pub fn add_to_existing(
             w.set_mount_point(new_mount.clone());
             dlog!("  mount point -> {new_mount:?}, existing entries prefixed with {prefix:?}");
         }
-        let current = w.paths();
         for (item, entry) in plan.files.iter().zip(&mapping.entries) {
-            for old in current.iter().filter(|p| {
-                p.eq_ignore_ascii_case(entry) || p.to_lowercase() == entry.to_lowercase()
-            }) {
-                if w.remove(old) {
-                    stats.replaced += 1;
-                    dlog!("  replaced {old}");
+            match stream_file(w, entry, compress, &item.source) {
+                Ok(size) => {
+                    stats.added += 1;
+                    stats.input_bytes += size;
+                    dlog!("  + {entry} ({size} bytes) <- {}", item.source.display());
                 }
-            }
-            let data = std::fs::read(&item.source)
-                .map_err(|e| ModifyError::Read(item.source.clone(), e))?;
-            w.write_file(entry, compress, &data)?;
-            stats.added += 1;
-            stats.input_bytes += data.len() as u64;
-            dlog!(
-                "  + {entry} ({} bytes) <- {}",
-                data.len(),
-                item.source.display()
-            );
-            let mut name = win::wide(&item.source.to_string_lossy());
-            if !progress::report(&mut name, data.len().max(1) as u64) {
-                return Err(ModifyError::Aborted);
+                Err(e) => {
+                    failure = Some(e);
+                    return Err(ModifyError::Aborted);
+                }
             }
         }
         Ok(())
-    })?;
-    stats.pak_bytes = pak_bytes;
-    Ok(stats)
+    });
+    match (result, failure) {
+        (Ok(bytes), _) => {
+            stats.pak_bytes = bytes;
+            Ok(stats)
+        }
+        (Err(_), Some(e)) => Err(e),
+        (Err(e), None) => Err(e.into()),
+    }
+}
+
+/// Where new data starts (SPEC §4.4): reuse space at the end of the data
+/// area (removed entries, earlier dead space) unless the undo copy that
+/// needs would exceed `UndoLimit`, in which case the user decides.
+fn choose_write_at(
+    info: &modify::Inspect,
+    removals: &[String],
+    limit: u64,
+) -> Result<Option<u64>, PackError> {
+    use crate::config::human_size;
+    let reuse = info.reuse_offset(removals);
+    if reuse < info.index_offset {
+        let undo = info.file_len - reuse;
+        let gain = info.index_offset - reuse;
+        dlog!("  reusable space at the end: {gain} bytes (undo copy {undo}, limit {limit})");
+        if undo <= limit {
+            return Ok(Some(reuse));
+        }
+        let text = format!(
+            "Reusing {} at the end of this pak (space of replaced or removed files) keeps it \
+             from growing, but the undo copy made before changing the pak would then be {}, \
+             over your limit of {} (UndoLimit).\n\n\
+             Yes: reuse the space (make the {} undo copy).\n\
+             No: add the files at the end instead (small undo copy; the pak grows by up to {} more).",
+            human_size(gain),
+            human_size(undo),
+            human_size(limit),
+            human_size(undo),
+            human_size(gain)
+        );
+        if crate::dialog::confirm(&text) {
+            return Ok(Some(reuse));
+        }
+    }
+    let plain_undo = info.file_len - info.index_offset;
+    if plain_undo > limit {
+        let text = format!(
+            "The undo copy made before changing this pak (its index) would be {}, over your \
+             limit of {} (UndoLimit).\n\nMake it anyway and continue?",
+            human_size(plain_undo),
+            human_size(limit)
+        );
+        if !crate::dialog::confirm(&text) {
+            return Err(PackError::Aborted);
+        }
+    }
+    Ok(None)
 }
 
 /// The confirmation shown before widening a pak's mount point: says which
@@ -561,15 +756,17 @@ pub fn delete_entries(
     if selected.is_empty() {
         return Ok(stats);
     }
-    stats.pak_bytes = modify::modify(target, |w| {
-        for e in &selected {
-            if w.remove(e) {
-                stats.removed += 1;
-                dlog!("  - {e}");
-            }
-        }
-        Ok(())
-    })?;
+    let write_at = choose_write_at(
+        &info,
+        &selected,
+        crate::config::load_options().pack.undo_limit,
+    )?;
+    stats.reused = info.index_offset - write_at.unwrap_or(info.index_offset);
+    for e in &selected {
+        dlog!("  - {e}");
+    }
+    stats.removed = selected.len();
+    stats.pak_bytes = modify::modify(target, &selected, write_at, |_| Ok(()))?;
     Ok(stats)
 }
 

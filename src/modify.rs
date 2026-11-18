@@ -22,8 +22,6 @@ pub enum ModifyError {
     Io(io::Error),
     Pak(repak::Error),
     Aborted,
-    /// A source file could not be read.
-    Read(PathBuf, io::Error),
     /// Message for the user.
     User(String),
 }
@@ -36,7 +34,6 @@ impl std::fmt::Display for ModifyError {
             ModifyError::Io(e) => write!(f, "{e}"),
             ModifyError::Pak(e) => write!(f, "{e}"),
             ModifyError::Aborted => f.write_str("cancelled"),
-            ModifyError::Read(p, e) => write!(f, "could not read {}: {e}", p.display()),
             ModifyError::User(m) => f.write_str(m),
         }
     }
@@ -75,6 +72,26 @@ pub struct Inspect {
     pub entries: Vec<String>,
     /// Compression methods named in the footer slots (v8+).
     pub slots: Vec<String>,
+    /// Where each entry lies in the file (same order as `entries`).
+    pub spans: Vec<(u64, u64)>,
+    pub index_offset: u64,
+    pub file_len: u64,
+}
+
+impl Inspect {
+    /// First byte after the last entry that is kept when `removed` go away:
+    /// new data can start here instead of at the index (reusing the space of
+    /// removed entries and earlier dead space at the end of the data area).
+    pub fn reuse_offset(&self, removed: &[String]) -> u64 {
+        self.entries
+            .iter()
+            .zip(&self.spans)
+            .filter(|(p, _)| !removed.contains(p))
+            .map(|(_, (_, end))| *end)
+            .max()
+            .unwrap_or(0)
+            .min(self.index_offset)
+    }
 }
 
 pub fn inspect(pak: &Path) -> Result<Inspect, ModifyError> {
@@ -83,13 +100,20 @@ pub fn inspect(pak: &Path) -> Result<Inspect, ModifyError> {
     if p.encrypted_index() || p.entries().any(|(_, e)| e.encrypted) {
         return Err(ModifyError::Encrypted);
     }
+    let (entries, spans): (Vec<String>, Vec<(u64, u64)>) = p
+        .entries()
+        .map(|(path, e)| (path.to_string(), (e.offset, e.data_end)))
+        .unzip();
     Ok(Inspect {
         mount: p.mount_point().to_string(),
         version: p.version(),
-        entries: p.files(),
+        entries,
         slots: crate::archive::sniff_footer(pak)
             .map(|f| f.compression)
             .unwrap_or_default(),
+        spans,
+        index_offset: p.index_offset().unwrap_or(0),
+        file_len: std::fs::metadata(pak)?.len(),
     })
 }
 
@@ -101,10 +125,20 @@ fn rollback(file: &mut File, index_offset: u64, tail: &[u8], len: u64) -> io::Re
     file.sync_all()
 }
 
-/// Opens `pak` for writing, runs `edit` on a writer positioned at the old
-/// index, writes the new index, truncates. Restores the original on any
-/// error, cancel or panic. Returns the new file size.
-pub fn modify<F>(pak: &Path, edit: F) -> Result<u64, ModifyError>
+/// Opens `pak` for writing, removes `removals`, runs `edit` on a writer
+/// positioned at `write_at` (default: the old index), writes the new index,
+/// truncates. Restores the original on any error, cancel or panic. Returns
+/// the new file size.
+///
+/// `write_at` before the index reuses space: every entry still in the pak
+/// after the removals must end at or before it, which is checked before
+/// anything is written.
+pub fn modify<F>(
+    pak: &Path,
+    removals: &[String],
+    write_at: Option<u64>,
+    edit: F,
+) -> Result<u64, ModifyError>
 where
     F: FnOnce(&mut repak::PakWriter<BufWriter<&mut File>>) -> Result<(), ModifyError>,
 {
@@ -123,11 +157,30 @@ where
     let index_offset = reader
         .index_offset()
         .ok_or_else(|| ModifyError::User("pak has no index offset".into()))?;
+    let start = write_at.unwrap_or(index_offset);
+    if start > index_offset {
+        return Err(ModifyError::User(format!(
+            "write offset {start} lies after the index"
+        )));
+    }
+    if let Some((path, e)) = reader
+        .entries()
+        .find(|(p, e)| !removals.iter().any(|r| r == p) && e.data_end > start)
+    {
+        return Err(ModifyError::User(format!(
+            "internal check failed: {path} ({}..{}) would be overwritten at {start}",
+            e.offset, e.data_end
+        )));
+    }
 
-    // 1. save the tail
-    let mut tail = vec![0; (len - index_offset) as usize];
+    // 1. save the tail (from where writing starts: index + footer, plus any
+    //    reused space)
+    let index_offset = start;
+    let mut tail = Vec::new();
     file.seek(SeekFrom::Start(index_offset))?;
-    file.read_exact(&mut tail)?;
+    (&mut file)
+        .take(len - index_offset)
+        .read_to_end(&mut tail)?;
     {
         let mut undo = OpenOptions::new()
             .write(true)
@@ -146,7 +199,10 @@ where
 
     // 2. edit + new index + truncate
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut w = reader.into_pakwriter(BufWriter::new(&mut file))?;
+        let mut w = reader.into_pakwriter_at(BufWriter::new(&mut file), index_offset)?;
+        for r in removals {
+            w.remove(r);
+        }
         edit(&mut w)?;
         let out = w.write_index()?;
         let f = out

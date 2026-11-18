@@ -131,6 +131,7 @@ impl Archive {
                     compression: None,
                     encrypted: false,
                     timestamp: None,
+                    data_end: 0,
                 },
                 mount_dir: true,
             });
@@ -205,12 +206,23 @@ impl Archive {
     }
 
     /// Decompresses the current entry into `out`.
-    pub fn read_current<W: Write>(&mut self, out: &mut W) -> Result<(), repak::Error> {
+    /// Streams the current entry into `out` (block by block); with `verify`
+    /// the entry's SHA-1 is checked too (`Error::HashMismatch`).
+    pub fn read_current<W: Write>(
+        &mut self,
+        out: &mut W,
+        verify: bool,
+    ) -> Result<(), repak::Error> {
         let item = self
             .current
             .and_then(|i| self.items.get(i))
             .ok_or_else(|| repak::Error::MissingEntry(String::new()))?;
-        self.pak.read_file(&item.pak_path, &mut self.reader, out)
+        if verify {
+            self.pak
+                .read_file_verified(&item.pak_path, &mut self.reader, out)
+        } else {
+            self.pak.read_file(&item.pak_path, &mut self.reader, out)
+        }
     }
 
     /// Extracts the current entry to `dest`, removing a partial file on failure.
@@ -225,7 +237,7 @@ impl Archive {
         let file = File::create(dest).map_err(ExtractError::Create)?;
         let mut out = wrap(BufWriter::new(file));
         let result = self
-            .read_current(&mut out)
+            .read_current(&mut out, false)
             .map_err(ExtractError::from_repak)
             .and_then(|_| out.finish().map_err(ExtractError::from_write));
         drop(out);
